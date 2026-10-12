@@ -182,14 +182,52 @@ pub async fn forward(
 ) -> anyhow::Result<()> {
     let source = client.peer_addr()?;
     let destination = client.local_addr()?;
-    let (host, original) = timeout(
+    let (host, original, next_state) = timeout(
         options.handshake_timeout,
-        protocol::handshake(&mut client, options.max_frame),
+        protocol::read_handshake(&mut client, options.max_frame),
     )
     .await
     .context("handshake timeout")??;
     let snapshot = state.snapshot.read().unwrap().clone();
     let route = snapshot.resolve(&host).context("no accepted route")?;
+    let route = route.clone();
+    drop(snapshot);
+    if next_state == 1 {
+        let mut client = MeteredStream {
+            stream: client,
+            state: state.clone(),
+            activity: Arc::new(Mutex::new(Instant::now())),
+        };
+        return timeout(
+            Duration::from_secs(10),
+            status_exchange(
+                &mut client,
+                &state,
+                options,
+                &route,
+                &original,
+                source,
+                destination,
+            ),
+        )
+        .await
+        .context("status exchange timeout")?;
+    }
+    let session = state.register_route(&route.id)?;
+    tokio::select! {
+        result = forward_login(client, state.clone(), options, route, original, source, destination) => result,
+        _ = session.cancel.cancelled() => Ok(()),
+    }
+}
+async fn forward_login(
+    client: TcpStream,
+    state: Arc<State>,
+    options: &Options,
+    route: crate::model::Route,
+    original: Vec<u8>,
+    source: std::net::SocketAddr,
+    destination: std::net::SocketAddr,
+) -> anyhow::Result<()> {
     let proxy_protocol = route.proxy_protocol;
     let (mut local, mut global): (Vec<_>, Vec<_>) = route
         .endpoints
@@ -197,7 +235,6 @@ pub async fn forward(
         .filter(|e| state.usable(e))
         .cloned()
         .partition(|e| e.node_name.as_deref() == Some(state.node.as_str()));
-    drop(snapshot);
     {
         let mut rng = rand::rng();
         local.shuffle(&mut rng);
@@ -312,6 +349,106 @@ pub async fn forward(
         }
     }
     Ok(())
+}
+
+async fn status_exchange(
+    client: &mut MeteredStream,
+    state: &Arc<State>,
+    options: &Options,
+    route: &crate::model::Route,
+    original: &[u8],
+    source: std::net::SocketAddr,
+    destination: std::net::SocketAddr,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        protocol::frame(client, 1).await? == [0],
+        "expected status request"
+    );
+    let maintenance = state.maintenance(route);
+    let mut response = None;
+    if !maintenance {
+        let (mut local, mut global): (Vec<_>, Vec<_>) = route
+            .endpoints
+            .iter()
+            .filter(|e| state.usable(e))
+            .cloned()
+            .partition(|e| e.node_name.as_deref() == Some(&state.node));
+        {
+            let mut rng = rand::rng();
+            local.shuffle(&mut rng);
+            global.shuffle(&mut rng);
+        }
+        let deadline = Instant::now() + options.connect_deadline;
+        let candidates = candidate_order(local, global);
+        for (index, endpoint) in candidates.iter().enumerate() {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if !state
+                .circuits
+                .lock()
+                .unwrap()
+                .entry(endpoint.id.clone())
+                .or_default()
+                .acquire()
+            {
+                continue;
+            }
+            let mut guard = Attempt {
+                state: state.clone(),
+                id: endpoint.id.clone(),
+                completed: false,
+            };
+            let later_global = candidates[index + 1..]
+                .iter()
+                .any(|e| e.node_name.as_deref() != Some(&state.node));
+            let end = if later_global && endpoint.node_name.as_deref() == Some(&state.node) {
+                deadline
+                    .checked_sub(options.connect_timeout.min(options.connect_deadline / 2))
+                    .unwrap_or(deadline)
+            } else {
+                deadline
+            };
+            let result = timeout_at(end.min(Instant::now() + options.connect_timeout), async {
+                let mut upstream = MeteredStream {
+                    stream: TcpStream::connect(endpoint.address).await?,
+                    state: state.clone(),
+                    activity: Arc::new(Mutex::new(Instant::now())),
+                };
+                if route.proxy_protocol {
+                    upstream
+                        .write_all(&protocol::proxy_v2(source, destination)?)
+                        .await?;
+                }
+                upstream.write_all(original).await?;
+                protocol::write_frame(&mut upstream, &[0]).await?;
+                let packet = protocol::frame(&mut upstream, 196608).await?;
+                protocol::validate_status(&packet)?;
+                anyhow::Ok(packet)
+            })
+            .await;
+            let mut circuits = state.circuits.lock().unwrap();
+            let circuit = circuits.entry(endpoint.id.clone()).or_default();
+            guard.completed = true;
+            match result {
+                Ok(Ok(packet)) => {
+                    circuit.success();
+                    selected(state, endpoint);
+                    response = Some(packet);
+                    break;
+                }
+                _ => {
+                    circuit.failure();
+                    state.event(format!("upstream status failed: {}", endpoint.id));
+                }
+            }
+        }
+    }
+    let packet = response
+        .unwrap_or_else(|| protocol::status_packet(&route.fallback_status.response(maintenance)));
+    protocol::write_frame(client, &packet).await?;
+    // Status latency consistently measures the ingress, including fallback responses.
+    protocol::pong(client).await
 }
 
 fn candidate_order(mut local: Vec<Endpoint>, mut global: Vec<Endpoint>) -> Vec<Endpoint> {

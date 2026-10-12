@@ -14,9 +14,15 @@ export type Endpoint = {
 export type Route = {
   id: string;
   hostnames: string[];
+  admission?: "normal" | "maintenance" | "unavailable";
+  allowConnections?: boolean;
+  activeConnections?: number;
+  usableLocal?: number;
+  usableGlobal?: number;
   proxyProtocol: boolean;
   endpoints: Backend[];
   errors: string[];
+  backendErrors?: string[];
 };
 export type Counters = {
   connections: number;
@@ -64,7 +70,7 @@ export type Resolution = {
 };
 export type Operation = {
   instance: Instance;
-  name: "admission" | "exclude" | "reset";
+  name: "admission" | "exclude" | "reset" | "route";
   title: string;
   body: Record<string, unknown>;
   endpoint?: string;

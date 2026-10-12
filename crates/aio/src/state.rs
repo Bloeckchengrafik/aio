@@ -79,7 +79,34 @@ impl Circuit {
     }
 }
 
+#[derive(Default)]
+pub struct RouteControl {
+    pub blocked: bool,
+    pub sessions: HashMap<u64, tokio_util::sync::CancellationToken>,
+}
+pub struct RouteSession {
+    pub state: Arc<State>,
+    pub route: String,
+    pub id: u64,
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+impl Drop for RouteSession {
+    fn drop(&mut self) {
+        if let Some(c) = self
+            .state
+            .route_controls
+            .lock()
+            .unwrap()
+            .get_mut(&self.route)
+        {
+            c.sessions.remove(&self.id);
+        }
+    }
+}
+
 pub struct State {
+    pub route_controls: Mutex<HashMap<String, RouteControl>>,
+    session_sequence: AtomicU64,
     pub started: Instant,
     pub node: String,
     pub instance: String,
@@ -112,6 +139,8 @@ impl State {
     pub fn new(node: String, instance: String) -> Arc<Self> {
         let (admission, _) = watch::channel(true);
         Arc::new(Self {
+            route_controls: Mutex::new(HashMap::new()),
+            session_sequence: AtomicU64::new(0),
             started: Instant::now(),
             node,
             instance,
@@ -140,7 +169,75 @@ impl State {
             listener_changed: Notify::new(),
         })
     }
+    pub fn register_route(self: &Arc<Self>, id: &str) -> anyhow::Result<RouteSession> {
+        let mut controls = self.route_controls.lock().unwrap();
+        let snapshot = self.snapshot.read().unwrap();
+        let route = snapshot
+            .routes
+            .iter()
+            .find(|r| r.id == id)
+            .ok_or_else(|| anyhow::anyhow!("route removed"))?;
+        anyhow::ensure!(route.errors.is_empty(), "route configuration is invalid");
+        let control = controls.entry(id.into()).or_default();
+        anyhow::ensure!(
+            route.allow_connections && !control.blocked,
+            "route is in maintenance"
+        );
+        let sequence = self.session_sequence.fetch_add(1, Ordering::Relaxed);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        control.sessions.insert(sequence, cancel.clone());
+        Ok(RouteSession {
+            state: self.clone(),
+            route: id.into(),
+            id: sequence,
+            cancel,
+        })
+    }
+    pub fn maintenance(&self, route: &crate::model::Route) -> bool {
+        !route.allow_connections
+            || self
+                .route_controls
+                .lock()
+                .unwrap()
+                .get(&route.id)
+                .is_some_and(|c| c.blocked)
+    }
+    pub fn route_view(&self, route: &crate::model::Route) -> serde_json::Value {
+        let mut value = serde_json::to_value(route).unwrap();
+        let controls = self.route_controls.lock().unwrap();
+        let c = controls.get(&route.id);
+        let maintenance = !route.allow_connections || c.is_some_and(|c| c.blocked);
+        let usable = route
+            .endpoints
+            .iter()
+            .filter(|e| self.usable(e))
+            .collect::<Vec<_>>();
+        value["admission"] = serde_json::json!(if maintenance {
+            "maintenance"
+        } else if usable.is_empty() || !route.errors.is_empty() {
+            "unavailable"
+        } else {
+            "normal"
+        });
+        value["activeConnections"] = serde_json::json!(c.map_or(0, |c| c.sessions.len()));
+        value["usableLocal"] = serde_json::json!(
+            usable
+                .iter()
+                .filter(|e| e.node_name.as_deref() == Some(&self.node))
+                .count()
+        );
+        value["usableGlobal"] = serde_json::json!(
+            usable
+                .iter()
+                .filter(|e| e.node_name.as_deref() != Some(&self.node))
+                .count()
+        );
+        value
+    }
     pub fn publish(&self, snapshot: Snapshot) {
+        let mut controls = self.route_controls.lock().unwrap();
+        controls
+            .retain(|id, c| !c.sessions.is_empty() || snapshot.routes.iter().any(|r| &r.id == id));
         let ids: std::collections::HashSet<_> = snapshot
             .routes
             .iter()

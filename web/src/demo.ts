@@ -98,7 +98,19 @@ export function demoFleet(): Instance[] {
             errors: 0,
           },
         },
-        routes: { generation: 42, routes },
+        routes: {
+          generation: 42,
+          routes: routes.map((route, i) => ({
+            ...route,
+            allowConnections: true,
+            admission: route.endpoints.length ? "normal" : "unavailable",
+            activeConnections: i === 0 ? [128, 76, 32][index] : 0,
+            usableLocal: route.endpoints.filter((e) => e.nodeName === node)
+              .length,
+            usableGlobal: route.endpoints.filter((e) => e.nodeName !== node)
+              .length,
+          })),
+        },
         endpoints: endpoints.map((e) => ({
           ...e,
           local: e.endpoint.nodeName === node,
@@ -119,6 +131,7 @@ export function demoFleet(): Instance[] {
       old.data!.status.terminating = true;
       old.data!.status.accepting = false;
       old.data!.status.activeConnections = 9;
+      old.data!.routes.routes[0].activeConnections = 9;
       old.data!.status.version = "0.0.9";
       old.data!.status.counters = undefined;
       return [instance, old];

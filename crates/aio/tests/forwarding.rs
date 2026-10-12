@@ -51,8 +51,11 @@ fn state(endpoints: Vec<Endpoint>, proxy_protocol: bool) -> Arc<State> {
                 id: "test/main".into(),
                 hostnames: vec!["play.asorda.net".into()],
                 proxy_protocol,
+                allow_connections: true,
+                fallback_status: Default::default(),
                 endpoints,
                 errors: vec![],
+                backend_errors: vec![],
             }],
         }
         .validate(),
@@ -241,7 +244,7 @@ async fn management_requires_auth_and_rejects_wrong_instance() {
         client
             .post(format!("{url}/api/v1/admission"))
             .bearer_auth("secret")
-            .json(&serde_json::json!({"instanceId":"old","accepting":false,"reason":"test"}))
+            .json(&serde_json::json!({"instanceId":"old","accepting":false}))
             .send()
             .await
             .unwrap()
@@ -384,4 +387,213 @@ async fn idle_stream_expires_and_bytes_are_visible_before_close() {
     assert!(result.unwrap_err().to_string().contains("inactivity"));
     let mut byte = [0; 1];
     assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn fallback_status_handles_request_and_pong_without_backend() {
+    for maintenance in [false, true] {
+        let state = state(vec![], false);
+        state
+            .route_controls
+            .lock()
+            .unwrap()
+            .entry("test/main".into())
+            .or_default()
+            .blocked = maintenance;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            router::forward(stream, state, &options(address))
+                .await
+                .unwrap();
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut handshake = packet();
+        *handshake.last_mut().unwrap() = 1;
+        client.write_all(&handshake).await.unwrap();
+        aio::protocol::write_frame(&mut client, &[0]).await.unwrap();
+        let response = aio::protocol::frame(&mut client, 196608).await.unwrap();
+        aio::protocol::validate_status(&response).unwrap();
+        assert!(String::from_utf8_lossy(&response).contains(if maintenance {
+            "Maintenance"
+        } else {
+            "Unavailable"
+        }));
+        let ping = [1, 0, 1, 2, 3, 4, 5, 6, 7];
+        aio::protocol::write_frame(&mut client, &ping)
+            .await
+            .unwrap();
+        assert_eq!(aio::protocol::frame(&mut client, 9).await.unwrap(), ping);
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn route_stop_preserves_sessions_and_kill_cancels_real_streams() {
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let state = state(
+        vec![endpoint("backend", backend.local_addr().unwrap(), "node-a")],
+        false,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let forwarding = state.clone();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        router::forward(stream, forwarding, &options(address))
+            .await
+            .unwrap();
+    });
+    let mut client = TcpStream::connect(address).await.unwrap();
+    client.write_all(&packet()).await.unwrap();
+    let (mut upstream, _) = backend.accept().await.unwrap();
+    let mut bytes = vec![0; packet().len()];
+    upstream.read_exact(&mut bytes).await.unwrap();
+    let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/api/v1/routes/control", api.local_addr().unwrap());
+    let api_state = state.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(api, aio::api::routes(api_state, "secret".into()))
+            .await
+            .unwrap();
+    });
+    let http = reqwest::Client::new();
+    for action in ["stop", "kill"] {
+        let response = http
+            .post(&url)
+            .bearer_auth("secret")
+            .json(&serde_json::json!({"instanceId":"test","routeId":"test/main","action":action}))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert!(state.register_route("test/main").is_err());
+        if action == "stop" {
+            upstream.write_all(b"alive").await.unwrap();
+            let mut reply = [0; 5];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"alive");
+        }
+    }
+    let mut byte = [0];
+    assert_eq!(
+        timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    task.await.unwrap();
+    assert_eq!(
+        state.route_view(&state.snapshot.read().unwrap().routes[0])["activeConnections"],
+        0
+    );
+    server.abort();
+}
+
+#[test]
+fn declarative_stop_cannot_be_overridden_and_icon_is_validated() {
+    let state = state(vec![], false);
+    let mut snapshot = (*state.snapshot.read().unwrap()).as_ref().clone();
+    snapshot.routes[0].allow_connections = false;
+    state.publish(snapshot);
+    assert!(state.register_route("test/main").is_err());
+    let status = aio::model::FallbackStatus {
+        favicon: Some("not a png".into()),
+        ..Default::default()
+    };
+    assert!(status.validate().is_err());
+}
+
+#[test]
+fn favicon_accepts_only_decodable_64_pixel_png() {
+    use base64::Engine;
+    for size in [64, 32] {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, size, size);
+            encoder.set_color(png::ColorType::Rgba);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&vec![0; (size * size * 4) as usize])
+                .unwrap();
+        }
+        let icon = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let status = aio::model::FallbackStatus {
+            favicon: Some(icon.clone()),
+            ..Default::default()
+        };
+        assert_eq!(status.validate().is_ok(), size == 64);
+        if size == 64 {
+            assert_eq!(
+                status.response(true)["favicon"],
+                format!("data:image/png;base64,{icon}")
+            );
+            assert_eq!(status.response(true)["players"]["online"], 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn broken_local_status_uses_fresh_global_response() {
+    let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let global = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let state = state(
+        vec![
+            endpoint("local", local.local_addr().unwrap(), "node-a"),
+            endpoint("global", global.local_addr().unwrap(), "node-b"),
+        ],
+        false,
+    );
+    let broken = tokio::spawn(async move {
+        let (mut stream, _) = local.accept().await.unwrap();
+        aio::protocol::handshake(&mut stream, 4096).await.unwrap();
+        aio::protocol::frame(&mut stream, 1).await.unwrap();
+        aio::protocol::write_frame(&mut stream, b"bad")
+            .await
+            .unwrap();
+    });
+    let expected = aio::protocol::status_packet(
+        &serde_json::json!({"version":{"name":"Live","protocol":47},"players":{"online":17,"max":100},"description":{"text":"fresh"}}),
+    );
+    let reply = expected.clone();
+    let healthy = tokio::spawn(async move {
+        let (mut stream, _) = global.accept().await.unwrap();
+        aio::protocol::handshake(&mut stream, 4096).await.unwrap();
+        aio::protocol::frame(&mut stream, 1).await.unwrap();
+        aio::protocol::write_frame(&mut stream, &reply)
+            .await
+            .unwrap();
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let forwarding = state.clone();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        router::forward(stream, forwarding, &options(address))
+            .await
+            .unwrap();
+    });
+    let mut client = TcpStream::connect(address).await.unwrap();
+    let mut handshake = packet();
+    *handshake.last_mut().unwrap() = 1;
+    client.write_all(&handshake).await.unwrap();
+    aio::protocol::write_frame(&mut client, &[0]).await.unwrap();
+    assert_eq!(
+        aio::protocol::frame(&mut client, 196608).await.unwrap(),
+        expected
+    );
+    aio::protocol::write_frame(&mut client, &[1, 0, 0, 0, 0, 0, 0, 0, 42])
+        .await
+        .unwrap();
+    aio::protocol::frame(&mut client, 9).await.unwrap();
+    broken.await.unwrap();
+    healthy.await.unwrap();
+    task.await.unwrap();
+    assert_eq!(
+        state.circuits.lock().unwrap()["local"].view()["failures"],
+        1
+    );
+    assert_eq!(state.global.load(Ordering::Relaxed), 1);
 }

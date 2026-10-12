@@ -1521,3 +1521,44 @@ footer {
     }
   }
 }
+
+.route-controls {
+  display: grid;
+  gap: 0.8rem;
+  padding: 1.4rem 0;
+}
+.route-controls p {
+  margin: 0;
+  color: var(--muted);
+}
+.route-controls select {
+  max-width: 28rem;
+}
+.hero .constellation {
+  display: none;
+}
+
+.route-instance-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.65rem 0;
+  font-size: 0.8rem;
+  border-bottom: 1px solid #ffffff12;
+}
+.route-instance-row small {
+  grid-column: 2 / -1;
+  opacity: 0.65;
+}
+.route-controls .dialog-actions {
+  flex-wrap: wrap;
+}
+@media (max-width: 600px) {
+  .route-controls .dialog-actions {
+    display: grid;
+  }
+  .route-controls .dialog-actions button {
+    width: 100%;
+  }
+}

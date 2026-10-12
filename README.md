@@ -50,8 +50,8 @@ The agent registration namespace is separate from the route namespace. Managemen
 ## Routing and operation
 
 - Bounded handshake parsing handles TCP fragmentation, preserves NUL-delimited extensions and leaves subsequent packets untouched.
-- Ready local endpoints are selected randomly before global ones. Connection failures try distinct alternatives, up to three attempts within five seconds. When global backends exist, reserve one attempt and part of the deadline for global fallback; multiple failed local backends cannot consume the full budget. No retries after forwarding starts.
-- Per-instance circuits open after three consecutive TCP connect failures; cooldown starts at ten seconds and doubles up to sixty seconds. Half-open admits one trial. Kubernetes readiness remains authoritative.
+- Ready local endpoints are selected randomly before global ones. Connection failures try distinct alternatives, up to three attempts within five seconds. When global backends exist, reserve one attempt and part of the deadline for global fallback; multiple failed local backends cannot consume the full budget. Login streams are never retried after forwarding starts.
+- Per-instance circuits open after three consecutive TCP connect or status-response failures; cooldown starts at ten seconds and doubles up to sixty seconds. Half-open admits one trial. Kubernetes readiness remains authoritative.
 - Exclusions are instance-local, expire by TTL and survive automatic circuit resets. They do not close established streams.
 - SO_REUSEPORT allows overlapping listeners using the same UID. Pause and SIGTERM close the listening socket while accepted streams continue. SIGTERM drains up to thirty minutes by default. Pausing alone does not exit the process.
 - Transient accept failures retry with bounded backoff and preserve existing streams. Failed listener resume remains paused, reports the bind error and can be retried; it does not terminate the agent.
@@ -62,7 +62,7 @@ The agent registration namespace is separate from the route namespace. Managemen
 - Existing streams are not migrated. Agent, node or Babylon crashes disconnect their sessions.
 - The dashboard supports instance status, routes, circuits, events, side-effect-free hostname resolution, pause/resume, exclusions and reset. It affects no traffic when unavailable.
 
-Agent management data/API operations require a bearer token; only agent health endpoints are unauthenticated. Dashboard web/API requests rely on Traefik authentication and are not independently authenticated by AIO. Mutation bodies require the current instance ID and an operator reason. This prototype has a single operator permission level.
+Agent management data/API operations require a bearer token; only agent health endpoints are unauthenticated. Dashboard web/API requests rely on Traefik authentication and are not independently authenticated by AIO. Mutation bodies require the current instance ID . This prototype has a single operator permission level.
 
 ## Prototype limits / next work
 
@@ -112,6 +112,12 @@ Headers:
     IncludeWhen: Authorized
 ```
 
-Use the plugin's authenticated-only header inclusion behaviour; protect direct access and do not bypass authentication for AIO. The dashboard records actor, instance, action, reason and response status in operation logs; without the header it records `unattributed`. These logs do not grant permissions or forward agent credentials to users. See the plugin's [header configuration](https://traefik-oidc-auth.sevensolutions.cc/docs/getting-started/middleware-configuration#header-block).
+Use the plugin's authenticated-only header inclusion behaviour; protect direct access and do not bypass authentication for AIO. The dashboard records actor, instance, action, target and response status in operation logs; without the header it records `unattributed`. These logs do not grant permissions or forward agent credentials to users. See the plugin's [header configuration](https://traefik-oidc-auth.sevensolutions.cc/docs/getting-started/middleware-configuration#header-block).
 
-The dashboard groups rollout instances by node, exposes configuration/watch errors, and shows instance-wide lifetime local/global selections. Throughput is computed only after two live counter samples. Hostname debugging returns server-derived matching/candidate results without opening a backend connection; the raw response remains expandable. Operator dialogs pin the instance and require a reason and bounded exclusion duration.
+The dashboard groups rollout instances by node, exposes configuration/watch errors, and displays route admission, real session counts, and usable local/global backends. Hostname debugging returns server-derived matching/candidate results without opening a backend connection; the raw response remains expandable. Routine actions need no reason; endpoint exclusions default to 15 minutes. Kill alone requires confirmation, showing known route session counts and explicit instance scope.
+
+### Route maintenance and fallback MOTDs
+
+`MinecraftRoute.spec.allowConnections: false` persists maintenance across agent restarts. The route page provides runtime Stop, Allow and Kill controls for a selected instance or all current instances (including draining); each target has an independent result. Stop preserves existing players. Kill blocks new logins and disconnects route sessions. Runtime controls are transient and Allow cannot override declarative maintenance.
+
+Configure `fallbackStatus` on the route (see `deploy/route.yaml`): maintenance and unavailable MOTDs, version labels, optional base64-encoded 64×64 PNG favicon, and numeric protocol (default -1). AIO forwards fresh healthy status responses; backend loss or status errors use the unavailable response. Fallback player counts are zero. Ping latency always measures AIO. No response cache is used.

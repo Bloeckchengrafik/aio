@@ -188,6 +188,7 @@ async fn action(
         "admission" => "admission",
         "exclude" => "endpoints/exclude",
         "reset" => "endpoints/reset",
+        "route" => "routes/control",
         _ => return Err((StatusCode::NOT_FOUND, "unknown action".into())),
     };
     let agent = s
@@ -214,7 +215,7 @@ async fn action(
         .and_then(|h| h.to_str().ok())
         .filter(|s| s.len() <= 256)
         .unwrap_or("unattributed");
-    tracing::info!(actor,instance=%id,action=%action,reason=?body.get("reason"),"dashboard operation requested");
+    tracing::info!(actor,instance=%id,action=%action,target=?body.get("routeId").or_else(||body.get("endpointId")),"dashboard operation requested");
     let response = s
         .client
         .post(format!("{}/api/v1/{path}", agent.url.trim_end_matches('/')))

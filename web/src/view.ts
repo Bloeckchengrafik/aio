@@ -18,7 +18,10 @@ export function problems(instance: Instance): string[] {
     ...(status?.listenerError ? [status.listenerError] : []),
     ...Object.values(status?.serviceErrors ?? {}),
     ...Object.values(status?.configErrors ?? {}),
-    ...(instance.data?.routes.routes.flatMap((r) => r.errors) ?? []),
+    ...(instance.data?.routes.routes.flatMap((r) => [
+      ...r.errors,
+      ...(r.backendErrors ?? []),
+    ]) ?? []),
     ...(instance.data?.endpoints
       .filter((e) => e.circuit.state === "open")
       .map((e) => `Circuit open: ${e.endpoint.address}`) ?? []),

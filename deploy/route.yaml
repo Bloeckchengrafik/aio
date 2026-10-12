@@ -9,6 +9,16 @@ spec:
     service: proxy
     port: 25565
   proxyProtocol: true
+  allowConnections: true
+  fallbackStatus:
+    protocol: -1
+    maintenance:
+      motd: "Asorda is undergoing maintenance. Please try again later."
+      versionName: Maintenance
+    unavailable:
+      motd: "Asorda is temporarily unavailable. Please try again shortly."
+      versionName: Unavailable
+    # favicon: "data:image/png;base64,<64x64 PNG>"
 ---
 apiVersion: v1
 kind: Service

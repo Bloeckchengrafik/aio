@@ -2,18 +2,11 @@
   import { onMount, tick } from "svelte";
   import Sigil from "./Sigil.svelte";
   import { demoFleet } from "./demo";
-  import {
-    admission,
-    bytes,
-    duration,
-    nodeName,
-    problems,
-    usable,
-  } from "./view";
+  import { admission, duration, nodeName, problems, usable } from "./view";
   import type { Instance, Endpoint, Resolution, Operation } from "./types";
 
   let instances = $state<Instance[]>([]);
-  let page = $state<"fleet" | "routes" | "activity">("fleet");
+  let page = $state<"fleet" | "routes" | "activity">("routes");
   let selected = $state("");
   let routeId = $state("");
   let loading = $state(true);
@@ -28,24 +21,23 @@
   let debugError = $state("");
   let debugging = $state(false);
   let operation = $state<Operation | null>(null);
-  let reason = $state("");
-  let ttl = $state("900");
+  let scope = $state("instance");
+  let targets = $state<Instance[]>([]);
+
   let operating = $state(false);
   let operationError = $state("");
   let dialog: HTMLDialogElement;
   let demo = $state(false);
-  let rates = $state<Record<string, number>>({});
+
   let controller: AbortController | undefined;
   let disposed = false;
 
   const current = $derived(instances.find((i) => i.instanceId === selected));
   const groups = $derived(
-    [...new Set(instances.map(nodeName))]
-      .sort()
-      .map((name) => ({
-        name,
-        instances: instances.filter((i) => nodeName(i) === name),
-      })),
+    [...new Set(instances.map(nodeName))].sort().map((name) => ({
+      name,
+      instances: instances.filter((i) => nodeName(i) === name),
+    })),
   );
   const active = $derived(
     instances.reduce((n, i) => n + (i.data?.status.activeConnections ?? 0), 0),
@@ -59,7 +51,13 @@
     ),
   );
   const routeList = $derived(
-    (current?.data?.routes.routes ?? []).filter((r) =>
+    [
+      ...new Map(
+        instances
+          .flatMap((i) => i.data?.routes.routes ?? [])
+          .map((r) => [r.id, r]),
+      ).values(),
+    ].filter((r) =>
       `${r.id} ${r.hostnames.join(" ")}`
         .toLowerCase()
         .includes(query.toLowerCase()),
@@ -75,15 +73,6 @@
   );
   const local = $derived(endpoints.filter((e) => e.local));
   const global = $derived(endpoints.filter((e) => !e.local));
-  const counters = $derived(current?.data?.status.counters);
-  const selections = $derived(
-    (counters?.localSelections ?? 0) + (counters?.globalSelections ?? 0),
-  );
-  const localPercent = $derived(
-    selections
-      ? Math.round(((counters?.localSelections ?? 0) / selections) * 100)
-      : null,
-  );
   const eventList = $derived(
     instances
       .flatMap((i) =>
@@ -123,24 +112,6 @@
       const result: { instances: Instance[]; observedAt: number } =
         await response.json();
       if (disposed) return;
-      const nextRates: Record<string, number> = {};
-      for (const next of result.instances) {
-        const old = instances.find((i) => i.instanceId === next.instanceId);
-        const elapsed = next.observedAt - (old?.observedAt ?? next.observedAt);
-        const delta =
-          (next.data?.status.counters?.bytes ?? 0) -
-          (old?.data?.status.counters?.bytes ?? 0);
-        if (
-          old?.reachable &&
-          next.reachable &&
-          old.data?.status.counters &&
-          next.data?.status.counters &&
-          elapsed > 0 &&
-          delta >= 0
-        )
-          nextRates[next.instanceId] = delta / elapsed;
-      }
-      rates = nextRates;
       instances = result.instances.sort(
         (a, b) =>
           nodeName(a).localeCompare(nodeName(b)) ||
@@ -244,27 +215,33 @@
   ) {
     if (!current || demo || !current.reachable || current.stale) return;
     operation = { instance: current, name, body, title, endpoint };
-    reason = "";
-    ttl = "900";
+    targets = [current];
     operationError = "";
-    await tick();
-    dialog.showModal();
+    await executeOperation();
   }
   async function executeOperation() {
-    if (!operation || !reason.trim() || operating) return;
+    if (!operation || operating) return;
     operating = true;
     operationError = "";
     try {
       const body = {
         ...operation.body,
-        reason: reason.trim(),
         ...(operation.name === "exclude" && operation.body.ttlSeconds !== 0
-          ? { ttlSeconds: Number(ttl) }
+          ? { ttlSeconds: 900 }
           : {}),
       };
-      await apiAction(operation.instance.instanceId, operation.name, body);
-      notice = `${operation.title} completed on ${nodeName(operation.instance)}.`;
-      dialog.close();
+      const results = await Promise.allSettled(
+        targets.map((target) =>
+          apiAction(target.instanceId, operation!.name, body),
+        ),
+      );
+      notice = results
+        .map(
+          (result, index) =>
+            `${nodeName(targets[index])}: ${targets[index].instanceId} · ${result.status === "fulfilled" ? "completed" : String(result.reason)}`,
+        )
+        .join(" · ");
+      if (dialog.open) dialog.close();
       operation = null;
       await refresh();
     } catch (e) {
@@ -272,6 +249,53 @@
     } finally {
       operating = false;
     }
+  }
+  async function controlRoute(action: "stop" | "allow" | "kill") {
+    if (!current || !route || demo || operating) return;
+    targets = scope === "all" ? instances.filter((i) => !i.stale) : [current];
+    operation = {
+      instance: current,
+      name: "route",
+      title:
+        action === "kill"
+          ? "Stop connections and disconnect players"
+          : action === "stop"
+            ? "Stop new connections"
+            : "Allow new connections",
+      body: { routeId: route.id, action },
+    };
+    operationError = "";
+    if (action === "kill") {
+      await tick();
+      dialog.showModal();
+    } else {
+      await executeOperation();
+    }
+  }
+  const affectedSessions = $derived(
+    targets.reduce(
+      (n, i) =>
+        n +
+        (i.data?.routes.routes.find((r) => r.id === routeId)
+          ?.activeConnections ?? 0),
+      0,
+    ),
+  );
+  function routeSummary(id: string): string {
+    const observations = instances
+      .filter((i) => !i.stale)
+      .map((i) => i.data?.routes.routes.find((r) => r.id === id));
+    const states = [
+      ...new Set(
+        observations.filter((r) => r).map((r) => r!.admission ?? "unknown"),
+      ),
+    ];
+    const count = observations.reduce(
+      (n, r) => n + (r?.activeConnections ?? 0),
+      0,
+    );
+    const unknown = instances.some((i) => !i.stale && !i.reachable);
+    return `${states.length > 1 ? "Mixed" : (states[0] ?? "Unknown")} · ${count}${unknown ? "+" : ""} sessions across observed instances`;
   }
   function endpointLabel(e: Endpoint): string {
     return e.circuit.exclusion
@@ -314,18 +338,18 @@
   <aside class="sidebar">
     <a class="brand" href="/" aria-label="Akasha ingress home"
       ><Sigil size={43} />
-      <div>AKASHA<span>INGRESS OBSERVATORY</span></div></a
+      <div>AKASHA<span>INGRESS</span></div></a
     >
     <div class="sidebar-divider"><span>✧</span></div>
     <span class="eyebrow sidebar-label">EXPLORE</span>
     <nav aria-label="Main navigation">
+      <button class:active={page === "routes"} onclick={() => (page = "routes")}
+        ><span class="nav-icon">⌘</span>Routes</button
+      >
       <button class:active={page === "fleet"} onclick={() => (page = "fleet")}
-        ><span class="nav-icon">◈</span>Fleet overview<span class="nav-count"
+        ><span class="nav-icon">◈</span>Nodes<span class="nav-count"
           >{groups.length}</span
         ></button
-      >
-      <button class:active={page === "routes"} onclick={() => (page = "routes")}
-        ><span class="nav-icon">⌘</span>Routes & backends</button
       >
       <button
         class:active={page === "activity"}
@@ -367,9 +391,9 @@
       <div class="breadcrumb">
         Akasha <span>/</span>
         {page === "fleet"
-          ? "Fleet overview"
+          ? "Nodes"
           : page === "routes"
-            ? "Routes & backends"
+            ? "Routes"
             : "Activity log"}
       </div>
       <div class="topbar-right">
@@ -393,7 +417,7 @@
       </div>
     </header>
     {#if demo}<div class="demo-banner">
-        Preview constellation · illustrative data, operator actions disabled.
+        Preview · illustrative data, operator actions disabled.
       </div>{/if}
     {#if error}<div class="alert">
         <strong>Fleet updates interrupted.</strong>
@@ -414,10 +438,10 @@
         <div class="eyebrow gold">THE AKASHA NETWORK</div>
         <h1>
           {page === "fleet"
-            ? "A constellation of connections."
+            ? "Nodes"
             : page === "routes"
-              ? "Find the path."
-              : "Signals from the fleet."}
+              ? "Routes"
+              : "Activity"}
         </h1>
         <p>
           {page === "fleet"
@@ -432,7 +456,7 @@
 
     {#if loading}<div class="empty-state">
         <Sigil size={56} />
-        <h2>Reading the constellation…</h2>
+        <h2>Discovering instances…</h2>
         <p>Discovering ingress instances and their routing snapshots.</p>
       </div>
     {:else if !instances.length}<div class="empty-state">
@@ -646,9 +670,7 @@
             <section class="route-list panel">
               <div class="panel-title">
                 <h3>Routes</h3>
-                <span class="badge neutral"
-                  >{current.data.routes.routes.length}</span
-                >
+                <span class="badge neutral">{routeList.length}</span>
               </div>
               <input
                 class="search"
@@ -661,6 +683,17 @@
                   class:route-selected={routeId === candidate.id}
                   onclick={() => {
                     routeId = candidate.id;
+                    if (
+                      !current?.data?.routes.routes.some(
+                        (r) => r.id === candidate.id,
+                      )
+                    )
+                      selected =
+                        instances.find((i) =>
+                          i.data?.routes.routes.some(
+                            (r) => r.id === candidate.id,
+                          ),
+                        )?.instanceId ?? selected;
                     resolution = null;
                   }}
                   ><span class="route-symbol"
@@ -668,7 +701,7 @@
                   >
                   <div>
                     <strong>{candidate.hostnames[0]}</strong><small
-                      >{candidate.id}</small
+                      >{candidate.id} · {routeSummary(candidate.id)}</small
                     >
                   </div>
                   <span class="route-chevron">›</span></button
@@ -698,71 +731,97 @@
                 <div class="hostname-tags">
                   {#each route.hostnames as host}<code>{host}</code>{/each}
                 </div>
-                {#if route.errors.length}<div class="alert">
-                    {route.errors.join(" · ")}
-                  </div>{/if}
-                <div class="routing-map">
-                  <div class="entry-node">
-                    <span class="orbit-ring"><Sigil size={34} /></span><strong
-                      >{nodeName(current)}</strong
-                    ><small>Traffic enters here</small>
-                  </div>
-                  <div class="route-branches" aria-hidden="true">
-                    <span class="solid-branch"></span><span
-                      class="dashed-branch"
-                    ></span>
-                  </div>
-                  <div class="routing-tiers">
-                    <div>
-                      <span class="tier-dot teal-dot"></span><strong
-                        >Local first</strong
-                      ><span
-                        >{local.filter(usable).length} usable / {local.length} ready</span
-                      >
-                    </div>
-                    <div>
-                      <span class="tier-dot gold-dot"></span><strong
-                        >Global fallback</strong
-                      ><span
-                        >{global.filter(usable).length} usable / {global.length}
-                        ready</span
-                      >
-                    </div>
-                  </div>
-                </div>
-                <div class="traffic-distribution">
-                  <div>
-                    <span>Instance locality</span><strong
-                      >{localPercent === null
-                        ? counters
-                          ? "No selections yet"
-                          : "Counters unavailable"
-                        : `${localPercent}% local`}</strong
-                    >
-                  </div>
-                  <div class="distribution-track">
-                    <span style:width={`${localPercent ?? 0}%`}></span>
-                  </div>
-                  <div class="distribution-labels">
-                    <span
-                      ><i class="tier-dot teal-dot"
-                      ></i>{counters?.localSelections?.toLocaleString() ?? "—"} local</span
-                    ><span
-                      >{counters?.globalSelections?.toLocaleString() ?? "—"} global<i
-                        class="tier-dot gold-dot"
-                      ></i></span
-                    >
-                  </div>
-                  <small
-                    >Lifetime selections across this instance · {rates[
-                      selected
-                    ] === undefined
-                      ? demo
-                        ? "No live throughput in demo"
-                        : "measuring throughput…"
-                      : `${bytes(rates[selected])}/s forwarded`}</small
+                {#if route.errors.length || route.backendErrors?.length}<div
+                    class="alert"
                   >
+                    {[...route.errors, ...(route.backendErrors ?? [])].join(
+                      " · ",
+                    )}
+                  </div>{/if}
+                <div class="route-controls">
+                  <strong
+                    >{route.admission ??
+                      (local.filter(usable).length +
+                      global.filter(usable).length
+                        ? "normal"
+                        : "unavailable")}</strong
+                  >
+                  <span
+                    >{route.activeConnections ?? "—"} active connections · {local.filter(
+                      usable,
+                    ).length} local / {global.filter(usable).length} global usable
+                    backends</span
+                  >
+                  <p>
+                    Stop blocks new logins and serves the maintenance MOTD.
+                    Existing players stay connected. Kill also disconnects
+                    existing players.
+                  </p>
+                  <label for="route-scope">Action scope</label>
+                  <select id="route-scope" bind:value={scope}
+                    ><option value="instance">Selected instance</option><option
+                      value="all"
+                      >All current instances (including draining)</option
+                    ></select
+                  >
+                  <div class="dialog-actions">
+                    <button
+                      class="secondary"
+                      disabled={demo || operating}
+                      onclick={() => controlRoute("stop")}
+                      >Stop new connections</button
+                    >
+                    <button
+                      class="secondary"
+                      disabled={demo ||
+                        operating ||
+                        route.allowConnections === false}
+                      onclick={() => controlRoute("allow")}
+                      >Allow new connections</button
+                    >
+                    <button
+                      class="secondary danger-text"
+                      disabled={demo || operating}
+                      onclick={() => controlRoute("kill")}
+                      >Stop connections and disconnect players</button
+                    >
+                  </div>
+                  {#if route.allowConnections === false}<p>
+                      Connections are disabled in MinecraftRoute. Update
+                      allowConnections to re-enable them.
+                    </p>{/if}
                 </div>
+                <details class="route-instances">
+                  <summary>State across current instances</summary>
+                  {#each instances.filter((i) => !i.stale) as instance}
+                    {@const observed = instance.data?.routes.routes.find(
+                      (r) => r.id === route.id,
+                    )}
+                    <div class="route-instance-row">
+                      <button
+                        class="secondary small"
+                        title={instance.instanceId}
+                        onclick={() => {
+                          selected = instance.instanceId;
+                        }}
+                        >{nodeName(instance)}{instance.data?.status.terminating
+                          ? " · draining"
+                          : ""}</button
+                      >
+                      <span
+                        >{observed?.admission ??
+                          (instance.reachable
+                            ? "Route absent"
+                            : "Unreachable")}</span
+                      >
+                      <span>{observed?.activeConnections ?? "—"} sessions</span>
+                      <small
+                        >{observed?.usableLocal ?? "—"} local / {observed?.usableGlobal ??
+                          "—"} global</small
+                      >
+                    </div>
+                  {/each}
+                </details>
                 {#each [{ name: "Local backends", values: local }, { name: "Global backends", values: global }] as tier}<div
                     class="backend-tier"
                   >
@@ -835,7 +894,8 @@
                       {#if endpoint.circuit.exclusion}<p
                           class="exclusion-reason"
                         >
-                          Excluded: {endpoint.circuit.exclusion.reason}
+                          Excluded for {endpoint.circuit.exclusion
+                            .remainingSeconds ?? "—"} seconds
                         </p>{/if}{/each}{#if !tier.values.length}<p
                         class="tier-empty"
                       >
@@ -851,7 +911,8 @@
                 </div>{/if}
             </section>
           </div>
-          <section class="debugger panel">
+          <details class="debugger panel">
+            <summary>Hostname debugger</summary>
             <div class="debugger-heading">
               <div>
                 <span class="eyebrow gold">TRACE A PATH</span>
@@ -900,12 +961,12 @@
                 <summary>Inspect raw response</summary>
                 <pre>{JSON.stringify(resolution, null, 2)}</pre>
               </details>{/if}
-          </section>
+          </details>
         {/if}
       {/if}
       {#if page === "activity"}<section class="panel activity-panel">
           <div class="panel-title">
-            <h3>Recent signals</h3>
+            <h3>Recent events</h3>
             <span class="muted">Newest first · bounded agent history</span>
           </div>
           {#each eventList as event}<div class="activity-row">
@@ -925,7 +986,7 @@
         </section>{/if}
     {/if}
     <footer>
-      <span>✧ AKASHA · Small paths. Shared horizons.</span><span
+      <span>✧ AKASHA · Ingress management</span><span
         >{observedAt
           ? `Last observed ${new Date(observedAt * 1000).toLocaleTimeString()}`
           : "Waiting for discovery"}</span
@@ -956,28 +1017,24 @@
       </div>
       <h2>{operation.title}</h2>
       <p>
-        This affects new connections on the selected instance. Established
-        streams stay open.
+        Stops new connections and disconnects {affectedSessions} known route sessions
+        across {targets.length} instance(s). Counts may change before the action
+        completes.
       </p>
+      {#if targets.some((i) => !i.reachable)}<div class="alert">
+          Some instances are unreachable. Their session counts are unknown and
+          the operation may only partially succeed.
+        </div>{/if}
       <div class="operation-target">
-        <strong>{nodeName(operation.instance)}</strong><code
-          >{operation.instance.instanceId}</code
-        >{#if operation.endpoint}<code>{operation.endpoint}</code>{/if}
+        <code>{String(operation.body.routeId)}</code>
+        {#each targets as target}<span
+            >{nodeName(target)} · <code>{target.instanceId}</code>{target.data
+              ?.status.terminating
+              ? " · draining"
+              : ""}{!target.reachable ? " · unreachable" : ""}</span
+          >{/each}
       </div>
-      {#if operation.name === "exclude" && operation.body.ttlSeconds !== 0}<label
-          for="ttl">Exclude for</label
-        ><select id="ttl" bind:value={ttl}
-          ><option value="300">5 minutes</option><option value="900"
-            >15 minutes</option
-          ><option value="3600">1 hour</option></select
-        >{/if}<label for="reason">Reason</label><textarea
-        id="reason"
-        bind:value={reason}
-        maxlength="256"
-        required
-        placeholder="What are you investigating or maintaining?"
-        rows="3"
-      ></textarea>{#if operationError}<div class="alert" role="alert">
+      {#if operationError}<div class="alert" role="alert">
           {operationError}
         </div>{/if}
       <div class="dialog-actions">
@@ -986,7 +1043,7 @@
           class="secondary"
           disabled={operating}
           onclick={() => dialog.close()}>Cancel</button
-        ><button class="primary" disabled={operating || !reason.trim()}
+        ><button class="primary" disabled={operating}
           >{operating ? "Applying…" : operation.title}</button
         >
       </div>

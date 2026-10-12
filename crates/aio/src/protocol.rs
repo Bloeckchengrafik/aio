@@ -1,6 +1,6 @@
 use anyhow::{Context, bail, ensure};
 use std::net::{IpAddr, SocketAddr};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 fn varint(bytes: &[u8], cursor: &mut usize) -> anyhow::Result<i32> {
     let mut value = 0u32;
@@ -18,10 +18,10 @@ fn varint(bytes: &[u8], cursor: &mut usize) -> anyhow::Result<i32> {
     bail!("oversized VarInt")
 }
 
-pub async fn handshake<R: AsyncRead + Unpin>(
+pub async fn read_handshake<R: AsyncRead + Unpin>(
     reader: &mut R,
     max_frame: usize,
-) -> anyhow::Result<(String, Vec<u8>)> {
+) -> anyhow::Result<(String, Vec<u8>, i32)> {
     let mut prefix = Vec::with_capacity(5);
     for i in 0..5 {
         let byte = reader.read_u8().await?;
@@ -57,13 +57,79 @@ pub async fn handshake<R: AsyncRead + Unpin>(
     cursor = end;
     ensure!(frame.get(cursor..cursor + 2).is_some(), "truncated port");
     cursor += 2;
-    ensure!(
-        matches!(varint(&frame, &mut cursor)?, 1 | 2),
-        "unsupported next state"
-    );
+    let next_state = varint(&frame, &mut cursor)?;
+    ensure!(matches!(next_state, 1 | 2), "unsupported next state");
     ensure!(cursor == frame.len(), "trailing handshake bytes");
     prefix.extend(frame);
-    Ok((host, prefix))
+    Ok((host, prefix, next_state))
+}
+
+pub async fn handshake<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_frame: usize,
+) -> anyhow::Result<(String, Vec<u8>)> {
+    let (host, original, _) = read_handshake(reader, max_frame).await?;
+    Ok((host, original))
+}
+fn encode(mut value: u32, out: &mut Vec<u8>) {
+    loop {
+        let b = (value & 127) as u8;
+        value >>= 7;
+        out.push(b | if value > 0 { 128 } else { 0 });
+        if value == 0 {
+            break;
+        }
+    }
+}
+pub async fn frame<R: AsyncRead + Unpin>(reader: &mut R, limit: usize) -> anyhow::Result<Vec<u8>> {
+    let mut prefix = Vec::new();
+    for i in 0..5 {
+        let b = reader.read_u8().await?;
+        prefix.push(b);
+        if b & 128 == 0 {
+            break;
+        }
+        ensure!(i < 4, "oversized frame");
+    }
+    let size = varint(&prefix, &mut 0)?;
+    ensure!(size > 0 && size as usize <= limit, "invalid frame size");
+    let mut bytes = vec![0; size as usize];
+    reader.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+pub async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let mut prefix = Vec::new();
+    encode(bytes.len() as u32, &mut prefix);
+    writer.write_all(&prefix).await?;
+    writer.write_all(bytes).await?;
+    Ok(())
+}
+pub fn status_packet(value: &serde_json::Value) -> Vec<u8> {
+    let text = value.to_string();
+    let mut bytes = vec![0];
+    encode(text.len() as u32, &mut bytes);
+    bytes.extend(text.as_bytes());
+    bytes
+}
+pub fn validate_status(bytes: &[u8]) -> anyhow::Result<()> {
+    let mut cursor = 0;
+    ensure!(varint(bytes, &mut cursor)? == 0, "expected status response");
+    let len = varint(bytes, &mut cursor)?;
+    ensure!(
+        len > 0 && cursor + len as usize == bytes.len(),
+        "invalid status string"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&bytes[cursor..])?;
+    ensure!(value.is_object(), "invalid status JSON");
+    Ok(())
+}
+pub async fn pong<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> anyhow::Result<()> {
+    let packet = frame(stream, 9).await?;
+    ensure!(packet.len() == 9 && packet[0] == 1, "expected ping");
+    write_frame(stream, &packet).await
 }
 
 pub fn proxy_v2(source: SocketAddr, destination: SocketAddr) -> anyhow::Result<Vec<u8>> {

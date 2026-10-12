@@ -15,6 +15,110 @@ pub struct RouteSpec {
     pub hostnames: Vec<String>,
     pub backend: Backend,
     pub proxy_protocol: bool,
+    #[serde(default = "enabled")]
+    pub allow_connections: bool,
+    #[serde(default)]
+    pub fallback_status: FallbackStatus,
+}
+
+pub fn enabled() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StatusMessage {
+    pub motd: String,
+    pub version_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FallbackStatus {
+    #[serde(default)]
+    pub favicon: Option<String>,
+    #[serde(default = "unavailable_protocol")]
+    pub protocol: i32,
+    #[serde(default = "maintenance_message")]
+    pub maintenance: StatusMessage,
+    #[serde(default = "unavailable_message")]
+    pub unavailable: StatusMessage,
+}
+fn unavailable_protocol() -> i32 {
+    -1
+}
+fn maintenance_message() -> StatusMessage {
+    StatusMessage {
+        motd: "Temporarily closed for maintenance. Please try again later.".into(),
+        version_name: "Maintenance".into(),
+    }
+}
+fn unavailable_message() -> StatusMessage {
+    StatusMessage {
+        motd: "No backend is available. Please try again shortly.".into(),
+        version_name: "Unavailable".into(),
+    }
+}
+impl Default for FallbackStatus {
+    fn default() -> Self {
+        Self {
+            favicon: None,
+            protocol: -1,
+            maintenance: maintenance_message(),
+            unavailable: unavailable_message(),
+        }
+    }
+}
+impl FallbackStatus {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for message in [&self.maintenance, &self.unavailable] {
+            anyhow::ensure!(
+                message.motd.len() <= 4096 && message.version_name.len() <= 128,
+                "fallback status text too large"
+            );
+        }
+        if let Some(icon) = &self.favicon {
+            use base64::Engine;
+            anyhow::ensure!(
+                icon.len() <= 131072,
+                "favicon exceeds 128 KiB encoded limit"
+            );
+            let encoded = icon.strip_prefix("data:image/png;base64,").unwrap_or(icon);
+            let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+            let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+            decoder.set_limits(png::Limits { bytes: 1024 * 1024 });
+            let mut reader = decoder.read_info()?;
+            anyhow::ensure!(
+                reader.info().width == 64 && reader.info().height == 64,
+                "favicon must be a 64x64 PNG"
+            );
+            let mut buffer = vec![
+                0;
+                reader
+                    .output_buffer_size()
+                    .ok_or_else(|| anyhow::anyhow!("invalid PNG dimensions"))?
+            ];
+            reader.next_frame(&mut buffer)?;
+        }
+        Ok(())
+    }
+    pub fn response(&self, maintenance: bool) -> serde_json::Value {
+        let message = if maintenance {
+            &self.maintenance
+        } else {
+            &self.unavailable
+        };
+        let mut response = serde_json::json!({"version":{"name":message.version_name,"protocol":self.protocol},"players":{"online":0,"max":0},"description":{"text":message.motd}});
+        if let Some(icon) = &self.favicon {
+            response["favicon"] =
+                serde_json::json!(if icon.starts_with("data:image/png;base64,") {
+                    icon.clone()
+                } else {
+                    format!("data:image/png;base64,{icon}")
+                });
+        }
+        response
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -38,10 +142,16 @@ pub struct Route {
     pub id: String,
     pub hostnames: Vec<String>,
     pub proxy_protocol: bool,
+    #[serde(default = "enabled")]
+    pub allow_connections: bool,
+    #[serde(default)]
+    pub fallback_status: FallbackStatus,
     #[serde(default)]
     pub endpoints: Vec<Endpoint>,
     #[serde(default)]
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub backend_errors: Vec<String>,
 }
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
@@ -89,6 +199,9 @@ impl Snapshot {
     pub fn validate(mut self) -> Self {
         let mut claims = std::collections::HashMap::<String, Vec<usize>>::new();
         for (i, route) in self.routes.iter_mut().enumerate() {
+            if let Err(error) = route.fallback_status.validate() {
+                route.errors.push(error.to_string());
+            }
             if route.hostnames.is_empty() {
                 route.errors.push("no hostnames".into());
             }
@@ -148,8 +261,11 @@ mod tests {
             id: id.into(),
             hostnames: vec![hostname.into()],
             proxy_protocol: false,
+            allow_connections: true,
+            fallback_status: Default::default(),
             endpoints: vec![],
             errors: vec![],
+            backend_errors: vec![],
         }
     }
     #[test]

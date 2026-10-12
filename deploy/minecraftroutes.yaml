@@ -21,6 +21,9 @@ spec:
           spec:
             additionalProperties: false
             properties:
+              allowConnections:
+                default: true
+                type: boolean
               backend:
                 additionalProperties: false
                 properties:
@@ -34,6 +37,54 @@ spec:
                 required:
                 - port
                 - service
+                type: object
+              fallbackStatus:
+                additionalProperties: false
+                default:
+                  favicon: null
+                  maintenance:
+                    motd: Temporarily closed for maintenance. Please try again later.
+                    versionName: Maintenance
+                  protocol: -1
+                  unavailable:
+                    motd: No backend is available. Please try again shortly.
+                    versionName: Unavailable
+                properties:
+                  favicon:
+                    nullable: true
+                    type: string
+                  maintenance:
+                    additionalProperties: false
+                    default:
+                      motd: Temporarily closed for maintenance. Please try again later.
+                      versionName: Maintenance
+                    properties:
+                      motd:
+                        type: string
+                      versionName:
+                        type: string
+                    required:
+                    - motd
+                    - versionName
+                    type: object
+                  protocol:
+                    default: -1
+                    format: int32
+                    type: integer
+                  unavailable:
+                    additionalProperties: false
+                    default:
+                      motd: No backend is available. Please try again shortly.
+                      versionName: Unavailable
+                    properties:
+                      motd:
+                        type: string
+                      versionName:
+                        type: string
+                    required:
+                    - motd
+                    - versionName
+                    type: object
                 type: object
               hostnames:
                 items:
