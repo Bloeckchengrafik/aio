@@ -89,7 +89,14 @@ pub struct State {
     pub synced: AtomicBool,
     pub terminating: AtomicBool,
     pub accepting: AtomicBool,
+    pub listener_bound: AtomicBool,
+    pub admission_operation: tokio::sync::Mutex<()>,
     pub watch_error: RwLock<Option<String>>,
+    pub service_errors: RwLock<HashMap<String, String>>,
+    pub listener_error: RwLock<Option<String>>,
+    pub config_errors: RwLock<HashMap<String, String>>,
+    pub accept_errors: AtomicU64,
+    pub fd_limit: AtomicU64,
     pub active: AtomicU64,
     pub total: AtomicU64,
     pub failures: AtomicU64,
@@ -113,7 +120,14 @@ impl State {
             synced: AtomicBool::new(false),
             terminating: AtomicBool::new(false),
             accepting: AtomicBool::new(false),
+            listener_bound: AtomicBool::new(false),
+            admission_operation: tokio::sync::Mutex::new(()),
             watch_error: RwLock::new(None),
+            service_errors: RwLock::new(HashMap::new()),
+            listener_error: RwLock::new(None),
+            config_errors: RwLock::new(HashMap::new()),
+            accept_errors: AtomicU64::new(0),
+            fd_limit: AtomicU64::new(0),
             active: AtomicU64::new(0),
             total: AtomicU64::new(0),
             failures: AtomicU64::new(0),
@@ -162,7 +176,7 @@ impl State {
             .is_none_or(Circuit::available)
     }
     pub fn status(&self) -> serde_json::Value {
-        serde_json::json!({"instanceId":self.instance,"nodeName":self.node,"version":env!("CARGO_PKG_VERSION"),"synced":self.synced.load(Ordering::Acquire),"accepting":self.accepting.load(Ordering::Acquire),"terminating":self.terminating.load(Ordering::Acquire),"generation":self.generation.load(Ordering::Relaxed),"activeConnections":self.active.load(Ordering::Relaxed),"watchError":*self.watch_error.read().unwrap()})
+        serde_json::json!({"instanceId":self.instance,"nodeName":self.node,"version":env!("CARGO_PKG_VERSION"),"synced":self.synced.load(Ordering::Acquire),"accepting":self.accepting.load(Ordering::Acquire),"terminating":self.terminating.load(Ordering::Acquire),"generation":self.generation.load(Ordering::Relaxed),"activeConnections":self.active.load(Ordering::Relaxed),"watchError":*self.watch_error.read().unwrap(),"serviceErrors":*self.service_errors.read().unwrap(),"listenerError":*self.listener_error.read().unwrap(),"configErrors":*self.config_errors.read().unwrap(),"fileDescriptorLimit":self.fd_limit.load(Ordering::Relaxed)})
     }
 }
 

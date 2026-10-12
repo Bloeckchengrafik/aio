@@ -43,17 +43,22 @@ kubectl apply -f deploy/dashboard.yaml
 
 Without `--config`, the agent watches MinecraftRoutes, Services and EndpointSlices through kube-rs. `AIO_NAMESPACE=*` watches all namespaces; a concrete namespace limits discovery. Backend Services must be headless and referenced in the route namespace. Discovery connects to ready, nonterminating endpoints directly and resolves the Service port to its EndpointSlice target port. Node name determines local preference; absent node identity is global. Watch reconnect/relist preserves cached routing during outages and removes stale resources after synchronization.
 
-The agent registration namespace is separate from the route namespace. Management binds to a concrete private node IP with an ephemeral port; the agent publishes its URL/Pod UID in a heartbeat Lease. Both old and new instances can register during surge updates. The dashboard discovers these Leases, or uses `--agents` for a static local inventory. Registrations older than 30 seconds are omitted; discovered-but-unreachable instances appear as errors.
+The agent registration namespace is separate from the route namespace. Management binds to a concrete private node IP with an ephemeral port; the agent publishes its URL/Pod UID in a heartbeat Lease. Both old and new instances can register during surge updates. The dashboard discovers these Leases, or uses `--agents` for a static local inventory. Registrations older than 30 seconds, or removed from discovery, remain visibly stale for up to 24 hours. Stale registrations cannot receive operator commands. Discovery outages also let cached heartbeat timestamps expire instead of displaying a falsely healthy inventory.
 
 `deploy/agent.yaml` is an example, not an automatically deployed configuration. Its Lease Role grants access to registrations in aio-system (not per-Lease admission enforcement). Restrict this namespace to trusted AIO workloads. Kubernetes RBAC cannot restrict arbitrary new Lease names with resourceNames; stronger per-instance write enforcement would require admission policy.
 
 ## Routing and operation
 
 - Bounded handshake parsing handles TCP fragmentation, preserves NUL-delimited extensions and leaves subsequent packets untouched.
-- Ready local endpoints are selected randomly before global ones. Connection failures try distinct alternatives, up to three attempts within five seconds. No retries after forwarding starts.
+- Ready local endpoints are selected randomly before global ones. Connection failures try distinct alternatives, up to three attempts within five seconds. When global backends exist, reserve one attempt and part of the deadline for global fallback; multiple failed local backends cannot consume the full budget. No retries after forwarding starts.
 - Per-instance circuits open after three consecutive TCP connect failures; cooldown starts at ten seconds and doubles up to sixty seconds. Half-open admits one trial. Kubernetes readiness remains authoritative.
 - Exclusions are instance-local, expire by TTL and survive automatic circuit resets. They do not close established streams.
 - SO_REUSEPORT allows overlapping listeners using the same UID. Pause and SIGTERM close the listening socket while accepted streams continue. SIGTERM drains up to thirty minutes by default. Pausing alone does not exit the process.
+- Transient accept failures retry with bounded backoff and preserve existing streams. Failed listener resume remains paused, reports the bind error and can be retried; it does not terminate the agent.
+- Discovery, management and registration tasks are supervised and restarted with backoff. Failed watch workers restart the discovery group, while cached routing and established streams remain usable. Service failures are exposed through status; discovery/management restart failures affect readiness, and registration failure is diagnostic only.
+- TCP keepalive is enabled (60-second idle, 20-second interval, three probes). A five-minute bidirectional inactivity deadline frees idle sessions; use `--idle-timeout-seconds 0` to disable it. Activity in either direction refreshes the deadline.
+- Startup checks the file-descriptor budget: two sockets per connection plus 128 descriptors of headroom. It raises the soft limit within the hard limit, or fails with a configuration error rather than advertising an unsupported connection limit.
+- Byte metrics count successful writes as they occur, including the buffered handshake and optional PROXY header, and retain partial progress on errors.
 - Existing streams are not migrated. Agent, node or Babylon crashes disconnect their sessions.
 - The dashboard supports instance status, routes, circuits, events, side-effect-free hostname resolution, pause/resume, exclusions and reset. It affects no traffic when unavailable.
 
@@ -62,8 +67,8 @@ All management data/API operations require a bearer token; only health endpoints
 ## Prototype limits / next work
 
 - Keycloak OIDC, separate view/operate roles, actor-attributed durable audit and production TLS integration are not implemented. Current events are bounded in-memory operation records.
-- Kubernetes malformed route updates are rejected rather than preserving historical valid resource specs; local-file mode does preserve last-valid configuration. Cold starts always use current resources.
-- Dashboard polling has bounded concurrency/timeouts but no persistent stale-history inventory, pagination or configurable backoff yet.
+- Invalid Kubernetes route specs retain their prior valid spec only for the same resource UID. Errors remain visible through status. Deletion or recreation clears history; cold starts use current resources. Missing backends and conflicting hostnames remain unavailable rather than overriding readiness or conflict checks.
+- Dashboard stale-history inventory is transient and is lost on dashboard restart. Pagination and configurable poll backoff are still pending.
 - Resource limits bound total connections and per-handshake buffers; there is no separate global byte-budget allocator. Relay buffers use Tokio's bounded copy buffers.
 - No live-cluster, public-IP preservation, Docker build or real Minecraft-client validation has been performed. Verify management firewall isolation and host-network surge scheduling on the target cluster.
 - Lease heartbeats use annotations for instance discovery; Lease spec is not used for leader election. Instances independently calculate routes and circuit state.
@@ -81,8 +86,9 @@ npm run build
 cd ..
 cargo build --locked --bins
 python3 scripts/smoke.py
+python3 scripts/fd_exhaustion.py
 ```
 
-Tests cover route precedence/conflicts, fragmented handshakes, framing, EndpointSlice port mapping, circuit transitions, local-to-global fallback, PROXY v2 on/off, management authentication and same-node listener overlap with established-stream continuity.
+Tests cover route precedence/conflicts, fragmented handshakes, framing, EndpointSlice port mapping, last-valid spec retention, circuit transitions, reserved global fallback, PROXY v2 on/off, management authentication, worker panic recovery, stale registration handling, failed resume, live byte accounting, idle expiry and same-node listener overlap. The Linux subprocess regression deliberately exhausts descriptors and verifies established-stream continuity and management recovery.
 
 Build both binaries and UI into the provided container with `docker build -t aio:prototype .`; override its command to `/usr/local/bin/aio-dashboard` for the dashboard deployment.

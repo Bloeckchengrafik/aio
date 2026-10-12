@@ -31,6 +31,10 @@ pub fn routes(state: Arc<AgentState>, token: String) -> Router {
         .route("/health/live", get(|| async { StatusCode::OK }))
         .route("/health/ready", get(ready))
         .merge(protected)
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(10),
+        ))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(16 * 1024))
         .with_state(state)
 }
@@ -40,13 +44,14 @@ pub async fn auth(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let expected = format!("Bearer {token}");
-    if request
+    use subtle::ConstantTimeEq;
+    let provided = request
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        != Some(&expected)
-    {
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if !bool::from(provided.as_bytes().ct_eq(token.as_bytes())) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(request).await)
@@ -55,6 +60,12 @@ async fn ready(State(s): State<Arc<AgentState>>) -> StatusCode {
     if s.synced.load(Ordering::Acquire)
         && s.accepting.load(Ordering::Acquire)
         && !s.terminating.load(Ordering::Acquire)
+        && !s
+            .service_errors
+            .read()
+            .unwrap()
+            .keys()
+            .any(|name| matches!(name.as_str(), "discovery" | "management"))
     {
         StatusCode::OK
     } else {
@@ -121,6 +132,7 @@ async fn admission(
     Json(body): Json<Admission>,
 ) -> Result<Json<serde_json::Value>, Error> {
     validate(&s, &body.instance_id, &body.reason)?;
+    let _operation = s.admission_operation.lock().await;
     if s.terminating.load(Ordering::Acquire) || !s.synced.load(Ordering::Acquire) {
         return Err((
             StatusCode::CONFLICT,
@@ -131,14 +143,28 @@ async fn admission(
     // Wait for the accept loop to close/rebind, rather than reporting intent as success.
     let confirmed = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if s.accepting.load(Ordering::Acquire) == body.accepting {
-                break;
+            if !body.accepting && !s.listener_bound.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if body.accepting
+                && s.listener_bound.load(Ordering::Acquire)
+                && s.accepting.load(Ordering::Acquire)
+            {
+                return Ok(());
+            }
+            if body.accepting && !*s.admission.borrow() {
+                return Err(s
+                    .listener_error
+                    .read()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "resume rejected".into()));
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .is_ok();
+    .await;
+    let confirmed = matches!(confirmed, Ok(Ok(())));
     s.event(format!(
         "operator admission={} reason={} confirmed={confirmed}",
         body.accepting, body.reason
@@ -228,6 +254,10 @@ async fn metrics(State(s): State<Arc<AgentState>>) -> String {
             s.global.load(Ordering::Relaxed),
         ),
         ("aio_forwarded_bytes_total", s.bytes.load(Ordering::Relaxed)),
+        (
+            "aio_accept_errors_total",
+            s.accept_errors.load(Ordering::Relaxed),
+        ),
     ]
     .into_iter()
     .map(|(name, value)| format!("{name} {value}\n"))

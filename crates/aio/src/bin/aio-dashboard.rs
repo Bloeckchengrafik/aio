@@ -33,6 +33,10 @@ struct Args {
 struct Agent {
     instance_id: String,
     url: String,
+    #[serde(default)]
+    last_heartbeat: Option<u64>,
+    #[serde(default)]
+    missing: bool,
 }
 struct Dashboard {
     agents: RwLock<HashMap<String, Agent>>,
@@ -89,9 +93,6 @@ async fn main() -> anyhow::Result<()> {
                             else {
                                 continue;
                             };
-                            if now.saturating_sub(updated) > 30 {
-                                continue;
-                            }
                             if let (Some(id), Some(url)) = (
                                 a.get("aio.akasha.asorda.net/instance-id"),
                                 a.get("aio.akasha.asorda.net/url"),
@@ -101,11 +102,14 @@ async fn main() -> anyhow::Result<()> {
                                     Agent {
                                         instance_id: id.clone(),
                                         url: url.clone(),
+                                        last_heartbeat: Some(updated),
+                                        missing: false,
                                     },
                                 );
                             }
                         }
-                        *state.agents.write().await = agents;
+                        let mut inventory = state.agents.write().await;
+                        merge_inventory(&mut inventory, agents, now);
                     }
                     Err(error) => {
                         tracing::warn!(%error,"registration discovery failed; retaining prior registrations")
@@ -123,6 +127,10 @@ async fn main() -> anyhow::Result<()> {
             aio::api::auth,
         ))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(16 * 1024))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(30),
+        ))
         .with_state(state)
         .fallback_service(ServeDir::new(args.web_dir));
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
@@ -135,6 +143,9 @@ async fn instances(State(s): State<Arc<Dashboard>>) -> Json<serde_json::Value> {
     use futures::{StreamExt, stream};
     let agents: Vec<_> = s.agents.read().await.values().cloned().collect();
     let items:Vec<_>=stream::iter(agents).map(|agent| {let s=s.clone(); async move {
+        if stale(&agent,now()) {
+            return serde_json::json!({"instanceId":agent.instance_id,"reachable":false,"stale":true,"lastHeartbeat":agent.last_heartbeat,"observedAt":now(),"error":"registration expired or removed"});
+        }
         let result=async {
             let mut values=serde_json::Map::new();
             for name in ["status","routes","endpoints","events"] {
@@ -143,7 +154,7 @@ async fn instances(State(s): State<Arc<Dashboard>>) -> Json<serde_json::Value> {
             }
             anyhow::Ok(serde_json::Value::Object(values))
         }.await;
-        match result { Ok(data)=>serde_json::json!({"instanceId":agent.instance_id,"reachable":true,"observedAt":now(),"data":data}),Err(error)=>serde_json::json!({"instanceId":agent.instance_id,"reachable":false,"observedAt":now(),"error":error.to_string()}) }
+        match result { Ok(data)=>serde_json::json!({"instanceId":agent.instance_id,"reachable":true,"stale":false,"lastHeartbeat":agent.last_heartbeat,"observedAt":now(),"data":data}),Err(error)=>serde_json::json!({"instanceId":agent.instance_id,"reachable":false,"stale":false,"lastHeartbeat":agent.last_heartbeat,"observedAt":now(),"error":error.to_string()}) }
     }}).buffer_unordered(8).collect().await;
     Json(serde_json::json!({"instances":items,"observedAt":now()}))
 }
@@ -173,6 +184,12 @@ async fn action(
         .get(&id)
         .cloned()
         .ok_or((StatusCode::NOT_FOUND, "unknown instance".into()))?;
+    if stale(&agent, now()) {
+        return Err((
+            StatusCode::CONFLICT,
+            "instance registration is stale; action refused".into(),
+        ));
+    }
     if action != "resolve" {
         let object = body
             .as_object_mut()
@@ -198,4 +215,52 @@ async fn action(
     Ok(Json(
         serde_json::from_str(&text).map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?,
     ))
+}
+
+fn stale(agent: &Agent, now: u64) -> bool {
+    agent.missing
+        || agent
+            .last_heartbeat
+            .is_some_and(|heartbeat| now.saturating_sub(heartbeat) > 30)
+}
+
+fn merge_inventory(
+    inventory: &mut HashMap<String, Agent>,
+    current: HashMap<String, Agent>,
+    now: u64,
+) {
+    for (id, agent) in inventory.iter_mut() {
+        if !current.contains_key(id) {
+            agent.missing = true;
+        }
+    }
+    inventory.extend(current);
+    // Bound historical registrations while retaining a full day of failed/drained instances.
+    inventory.retain(|_, agent| {
+        agent
+            .last_heartbeat
+            .is_none_or(|heartbeat| now.saturating_sub(heartbeat) <= 86400)
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn missing_and_expired_instances_remain_visible_but_cannot_receive_commands() {
+        let old = Agent {
+            instance_id: "old".into(),
+            url: "http://127.0.0.1:1".into(),
+            last_heartbeat: Some(100),
+            missing: false,
+        };
+        let mut inventory = HashMap::from([("old".into(), old)]);
+        merge_inventory(&mut inventory, HashMap::new(), 110);
+        assert!(inventory.contains_key("old"));
+        assert!(stale(&inventory["old"], 110));
+        inventory.get_mut("old").unwrap().missing = false;
+        assert!(stale(&inventory["old"], 131));
+        merge_inventory(&mut inventory, HashMap::new(), 86501);
+        assert!(inventory.is_empty());
+    }
 }

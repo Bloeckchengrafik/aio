@@ -3,10 +3,13 @@ use aio::{
     router::{self, Options},
     state::State,
 };
-use anyhow::Context;
 use clap::Parser;
 use std::{
-    future::IntoFuture, net::SocketAddr, path::PathBuf, sync::atomic::Ordering, time::Duration,
+    future::IntoFuture,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +39,8 @@ struct Args {
     connect_timeout_seconds: u64,
     #[arg(long, default_value_t = 1800)]
     drain_timeout_seconds: u64,
+    #[arg(long, default_value_t = 300)]
+    idle_timeout_seconds: u64,
     #[arg(long, default_value_t = 4096)]
     max_frame: usize,
     #[arg(long, default_value_t = 4096)]
@@ -60,23 +65,46 @@ async fn main() -> anyhow::Result<()> {
         (1..=4096).contains(&args.max_frame) && args.max_connections > 0,
         "invalid resource limits"
     );
+    anyhow::ensure!(
+        (1..=60).contains(&args.handshake_timeout_seconds)
+            && (1..=30).contains(&args.connect_timeout_seconds)
+            && args.idle_timeout_seconds <= 86400
+            && args.drain_timeout_seconds <= 86400,
+        "timeouts must be bounded: handshake 1–60s, connect 1–30s, idle/drain 0–86400s"
+    );
     let state = State::new(
         args.node_name,
         args.instance_id
             .unwrap_or_else(|| format!("local-{}", std::process::id())),
     );
+    #[cfg(unix)]
+    state.fd_limit.store(
+        aio::resources::ensure_descriptors(args.max_connections)?,
+        Ordering::Relaxed,
+    );
     let cancel = CancellationToken::new();
-    let discovery_task = {
-        let state = state.clone();
-        let cancel = cancel.clone();
-        tokio::spawn(async move {
-            if let Some(path) = args.config {
-                discovery::local_file(state, path, cancel).await
-            } else {
-                discovery::kubernetes(state, args.namespace, cancel).await
+    let discovery_state = state.clone();
+    let discovery_cancel = cancel.clone();
+    let config = args.config.clone();
+    let namespace = args.namespace.clone();
+    let discovery_task = tokio::spawn(aio::supervision::supervise(
+        state.clone(),
+        "discovery",
+        move || {
+            let state = discovery_state.clone();
+            let stop = discovery_cancel.clone();
+            let config = config.clone();
+            let namespace = namespace.clone();
+            async move {
+                if let Some(path) = config {
+                    discovery::local_file(state, path, stop).await
+                } else {
+                    discovery::kubernetes(state, namespace, stop).await
+                }
             }
-        })
-    };
+        },
+        cancel.clone(),
+    ));
     let management = tokio::net::TcpListener::bind(args.management_listen).await?;
     let management_address = management.local_addr()?;
     if let Some(path) = args.management_address_file {
@@ -89,20 +117,47 @@ async fn main() -> anyhow::Result<()> {
             !management_address.ip().is_unspecified() && !management_address.ip().is_loopback(),
             "registration requires a concrete reachable private management address"
         );
-        let state = state.clone();
+        let register_state = state.clone();
         let stop = registration_cancel.clone();
-        Some(tokio::spawn(async move {
-            aio::registration::run(state, management_address, namespace, stop).await
-        }))
+        Some(tokio::spawn(aio::supervision::supervise(
+            state.clone(),
+            "registration",
+            move || {
+                let state = register_state.clone();
+                let stop = stop.clone();
+                let namespace = namespace.clone();
+                async move { aio::registration::run(state, management_address, namespace, stop).await }
+            },
+            registration_cancel.clone(),
+        )))
     } else {
         None
     };
     let api_cancel = CancellationToken::new();
-    let api_task = tokio::spawn(
-        axum::serve(management, api::routes(state.clone(), args.api_token))
-            .with_graceful_shutdown(api_cancel.clone().cancelled_owned())
-            .into_future(),
-    );
+    let management = Arc::new(management.into_std()?);
+    let api_state = state.clone();
+    let api_stop = api_cancel.clone();
+    let token = args.api_token.clone();
+    let api_task = tokio::spawn(aio::supervision::supervise(
+        state.clone(),
+        "management",
+        move || {
+            let listener = management.try_clone();
+            let state = api_state.clone();
+            let stop = api_stop.clone();
+            let token = token.clone();
+            async move {
+                let listener = tokio::net::TcpListener::from_std(listener?)?;
+                state.service_errors.write().unwrap().remove("management");
+                axum::serve(listener, api::routes(state, token))
+                    .with_graceful_shutdown(stop.cancelled_owned())
+                    .into_future()
+                    .await?;
+                Ok(())
+            }
+        },
+        api_cancel.clone(),
+    ));
     let stop = cancel.clone();
     let signal_state = state.clone();
     tokio::spawn(async move {
@@ -111,32 +166,34 @@ async fn main() -> anyhow::Result<()> {
         stop.cancel();
     });
     while !state.synced.load(Ordering::Acquire) {
-        tokio::select! { _=cancel.cancelled()=>{ api_cancel.cancel(); return Ok(()); }, _=tokio::time::sleep(Duration::from_millis(50))=>{} }
-        if discovery_task.is_finished() {
-            discovery_task.await.context("discovery task failed")??;
-            anyhow::bail!("discovery stopped before initial synchronization");
-        }
+        tokio::select! { _=cancel.cancelled()=>break, _=tokio::time::sleep(Duration::from_millis(50))=>{} }
     }
-    let result = router::serve(
-        state,
-        Options {
-            listen: args.listen,
-            handshake_timeout: Duration::from_secs(args.handshake_timeout_seconds),
-            connect_timeout: Duration::from_secs(args.connect_timeout_seconds),
-            connect_deadline: Duration::from_secs(5),
-            max_frame: args.max_frame,
-            max_connections: args.max_connections,
-            drain_timeout: Duration::from_secs(args.drain_timeout_seconds),
-        },
-        cancel.clone(),
-    )
-    .await;
+    let result = if cancel.is_cancelled() {
+        Ok(())
+    } else {
+        router::serve(
+            state,
+            Options {
+                listen: args.listen,
+                handshake_timeout: Duration::from_secs(args.handshake_timeout_seconds),
+                connect_timeout: Duration::from_secs(args.connect_timeout_seconds),
+                connect_deadline: Duration::from_secs(5),
+                max_frame: args.max_frame,
+                max_connections: args.max_connections,
+                drain_timeout: Duration::from_secs(args.drain_timeout_seconds),
+                idle_timeout: Duration::from_secs(args.idle_timeout_seconds),
+            },
+            cancel.clone(),
+        )
+        .await
+    };
     cancel.cancel();
     api_cancel.cancel();
     registration_cancel.cancel();
-    api_task.await??;
+    api_task.await?;
+    discovery_task.await?;
     if let Some(task) = registration_task {
-        task.await??;
+        task.await?;
     }
     result
 }
