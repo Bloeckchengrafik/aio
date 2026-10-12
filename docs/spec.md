@@ -76,7 +76,7 @@ Build immutable snapshots and publish them atomically. Established connections r
 3. Extract the hostname. For NUL-delimited handshake extensions, match only the first hostname segment; preserve the entire original frame. Do not rewrite handshake content. Legacy pre-handshake ping is outside v1alpha1 scope.
 4. Match one accepted route. Unknown or unavailable routes close the connection without connecting to a backend.
 5. Select an eligible local endpoint uniformly, excluding open circuits and operator exclusions. If no usable local endpoints exist, select among usable global endpoints uniformly.
-6. Establish the upstream connection. On connection failure before application bytes are sent, try another distinct local endpoint, then global endpoints. Attempt at most three distinct endpoints within the total deadline. No retries after forwarding begins.
+6. Establish the upstream connection. On connection failure before application bytes are sent, try another distinct local endpoint, then global endpoints. Attempt at most three distinct endpoints within the total deadline. When global endpoints exist, reserve at least one attempt and a bounded part of the deadline for them. No retries after forwarding begins.
 7. If proxyProtocol is true, send exactly one PROXY protocol v2 header containing the observed client address and ingress destination. If false, send no PROXY header. Then forward all buffered client bytes in their original order.
 8. Forward bidirectionally with bounded buffering, backpressure and TCP half-close propagation until completion or failure.
 
@@ -96,7 +96,7 @@ Use DaemonSet RollingUpdate with maxSurge: 1, maxUnavailable: 0 and minReadySeco
 
 Do not deactivate automatically solely because a Kubernetes watch is disconnected. Explicit admission deactivation is available for operation/debugging; automatic self-deactivation beyond startup and shutdown is deferred.
 
-Endpoint removal or route changes affect new connections only. No new upstream selection is attempted for an established stream. New connections can fail during stale discovery or before a replacement proxy becomes ready; no zero-downtime guarantee is claimed.
+Endpoint removal or route changes affect new connections only. No new upstream selection is attempted for an established stream. Transient accept failures retry with bounded backoff without terminating established streams; failed resume remains paused and reports the bind failure. Background services are supervised and restarted independently of forwarding. TCP keepalive and a configurable inactivity deadline (default five minutes, zero disables it) bound dead/idle connection lifetimes. Startup verifies or raises the soft descriptor limit within the hard limit for two sockets per connection plus 128 descriptors of headroom. New connections can fail during stale discovery or before a replacement proxy becomes ready; no zero-downtime guarantee is claimed.
 
 ## Security and deployment
 
@@ -153,7 +153,7 @@ Use a Traefik-style overview: instance health and version, active connections, r
 
 Authenticate users through the existing Keycloak setup and authorize view versus operate access server-side. Mutations require an authenticated operator, CSRF protection where cookie authentication is used, and a reason. Operator actions preview the selected instances; fan-out returns per-instance results, including timeouts. No implicit all-node pause or transactional cluster-wide guarantee.
 
-Poll at a modest interval (default 5 seconds) with bounded concurrency, per-agent timeouts and backoff for unreachable agents. Display last-observed timestamps and stale/unreachable/draining states; stale values must not look healthy. Discover both versions during surge updates by Pod UID, not just node name. Agent management ports are protected by host firewall/private-network controls; host-network isolation must not be assumed from ordinary pod NetworkPolicy alone.
+Poll at a modest interval (default 5 seconds) with bounded concurrency, per-agent timeouts and backoff for unreachable agents. Retain stale/removed registrations for up to 24 hours in memory and reject mutations to them. Display last-observed timestamps and stale/unreachable/draining states; stale values must not look healthy. Discover both versions during surge updates by Pod UID, not just node name. Agent management ports are protected by host firewall/private-network controls; host-network isolation must not be assumed from ordinary pod NetworkPolicy alone.
 
 ## Observability
 

@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   type Endpoint = { endpoint: { id: string; address: string }; local: boolean; circuit: { state: string; failures: number; exclusion: { reason: string } | null } };
   type Route = { id: string; hostnames: string[]; proxyProtocol: boolean; errors: string[]; endpoints: unknown[] };
-  type Instance = { instanceId: string; reachable: boolean; error?: string; observedAt: number; data?: { status: { nodeName: string; accepting: boolean; terminating: boolean; activeConnections: number; generation: number; watchError: string | null }; routes: { routes: Route[] }; endpoints: Endpoint[]; events: { timestamp: number; message: string }[] } };
+  type Instance = { instanceId: string; reachable: boolean; stale?: boolean; lastHeartbeat?: number; error?: string; observedAt: number; data?: { status: { nodeName: string; accepting: boolean; terminating: boolean; activeConnections: number; generation: number; watchError: string | null; listenerError?: string | null; serviceErrors?: Record<string, string>; configErrors?: Record<string, string> }; routes: { routes: Route[] }; endpoints: Endpoint[]; events: { timestamp: number; message: string }[] } };
   let token = $state('');
   let instances = $state<Instance[]>([]);
   let selected = $state('');
@@ -53,11 +53,14 @@
       {@const data = current.data}
       <div class="stats"><article><span>ADMISSION</span><strong>{data.status.terminating ? 'Draining' : data.status.accepting ? 'Accepting' : 'Paused'}</strong></article><article><span>ACTIVE STREAMS</span><strong>{data.status.activeConnections}</strong></article><article><span>ROUTES</span><strong>{data.routes.routes.length}</strong></article><article><span>CONFIG GENERATION</span><strong>{data.status.generation}</strong></article></div>
       {#if data.status.watchError}<div class="error">Discovery: {data.status.watchError}</div>{/if}
+      {#if data.status.listenerError}<div class="error">Listener: {data.status.listenerError}</div>{/if}
+      {#each Object.entries(data.status.serviceErrors ?? {}) as [service, message]}<div class="error">{service}: {message}</div>{/each}
+      {#each Object.entries(data.status.configErrors ?? {}) as [route, message]}<div class="error">{route}: {message} — previous valid configuration retained when available.</div>{/each}
       <section><h2>Routes</h2><table><thead><tr><th>Route</th><th>Hostnames</th><th>Framing</th><th>Status</th></tr></thead><tbody>{#each data.routes.routes as route}<tr><td>{route.id}</td><td>{route.hostnames.join(', ')}</td><td>{route.proxyProtocol ? 'PROXY v2' : 'Plain TCP'}</td><td class:bad={route.errors.length > 0}>{route.errors.join('; ') || `${route.endpoints.length} endpoints`}</td></tr>{/each}</tbody></table></section>
       <section><h2>Backends & circuits</h2><p class="hint">Controls affect the selected instance only.</p><input bind:value={reason} placeholder="Operator reason" aria-label="Operator reason"><table><thead><tr><th>Backend</th><th>Tier</th><th>Circuit</th><th>Actions</th></tr></thead><tbody>{#each data.endpoints as endpoint}<tr><td>{endpoint.endpoint.address}<small>{endpoint.endpoint.id}</small></td><td>{endpoint.local ? 'Local' : 'Global'}</td><td>{endpoint.circuit.exclusion ? `Excluded: ${endpoint.circuit.exclusion.reason}` : endpoint.circuit.state}<small>{endpoint.circuit.failures} failures</small></td><td><button onclick={() => action('reset', { endpointId: endpoint.endpoint.id })}>Reset</button><button onclick={() => action('exclude', { endpointId: endpoint.endpoint.id, ttlSeconds: endpoint.circuit.exclusion ? 0 : 900 })}>{endpoint.circuit.exclusion ? 'Include' : 'Exclude 15m'}</button></td></tr>{/each}</tbody></table><button onclick={() => action('admission', { accepting: !data.status.accepting })} disabled={data.status.terminating}>{data.status.accepting ? 'Pause new connections' : 'Resume admission'}</button></section>
       <section><h2>Hostname debugger</h2><div class="access"><input bind:value={hostname} aria-label="Hostname"><button onclick={() => action('resolve', { hostname })}>Resolve without connecting</button></div>{#if output}<pre>{output}</pre>{/if}</section>
       <section><h2>Recent events</h2>{#each [...data.events].reverse() as event}<div class="event"><time>{new Date(event.timestamp * 1000).toLocaleTimeString()}</time><span>{event.message}</span></div>{/each}</section>
-    {:else if current}<div class="error">Instance unreachable: {current.error ?? 'No current response'}</div>
+    {:else if current}<div class="error">{current.stale ? 'Instance registration stale' : 'Instance unreachable'}: {current.error ?? 'No current response'}{#if current.lastHeartbeat}<small>Last heartbeat: {new Date(current.lastHeartbeat * 1000).toLocaleString()}</small>{/if}</div>
     {:else}<section class="empty"><h2>Inspect your ingress fleet</h2><p>Connect with a dashboard token to see routes, local and global backends, and circuit state.</p></section>{/if}
   </main>
 </div>

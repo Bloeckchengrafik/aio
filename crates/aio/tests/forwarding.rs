@@ -24,6 +24,7 @@ fn options(listen: SocketAddr) -> Options {
         max_frame: 4096,
         max_connections: 32,
         drain_timeout: Duration::from_secs(1),
+        idle_timeout: Duration::from_secs(60),
     }
 }
 fn packet() -> Vec<u8> {
@@ -248,4 +249,139 @@ async fn management_requires_auth_and_rejects_wrong_instance() {
         409
     );
     task.abort();
+}
+
+#[tokio::test]
+async fn three_failed_local_backends_cannot_starve_global_fallback() {
+    let global = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut reservations = vec![];
+    let mut endpoints = vec![];
+    for n in 0..3 {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        endpoints.push(endpoint(
+            &format!("dead-{n}"),
+            socket.local_addr().unwrap(),
+            "node-a",
+        ));
+        reservations.push(socket);
+    }
+    drop(reservations);
+    endpoints.push(endpoint("global", global.local_addr().unwrap(), "node-b"));
+    let state = state(endpoints, false);
+    let ingress = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = ingress.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (stream, _) = ingress.accept().await.unwrap();
+        router::forward(stream, state, &options(address))
+            .await
+            .unwrap();
+    });
+    let mut client = TcpStream::connect(address).await.unwrap();
+    client.write_all(&packet()).await.unwrap();
+    client.shutdown().await.unwrap();
+    let (mut backend, _) = timeout(Duration::from_secs(2), global.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut received = vec![];
+    backend.read_to_end(&mut received).await.unwrap();
+    assert_eq!(received, packet());
+    backend.shutdown().await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_resume_keeps_existing_stream_and_can_be_retried() {
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let state = state(
+        vec![endpoint("local", backend.local_addr().unwrap(), "node-a")],
+        false,
+    );
+    let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(router::serve(
+        state.clone(),
+        options(address),
+        cancel.clone(),
+    ));
+    wait_accepting(&state, true).await;
+    let mut client = TcpStream::connect(address).await.unwrap();
+    client.write_all(&packet()).await.unwrap();
+    let (mut upstream, _) = backend.accept().await.unwrap();
+    let mut frame = vec![0; packet().len()];
+    upstream.read_exact(&mut frame).await.unwrap();
+    state.admission.send_replace(false);
+    wait_accepting(&state, false).await;
+    let blocker = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .unwrap();
+    blocker.set_reuse_address(true).unwrap();
+    blocker.bind(&address.into()).unwrap();
+    blocker.listen(16).unwrap();
+    state.admission.send_replace(true);
+    timeout(Duration::from_secs(2), async {
+        while state.listener_error.read().unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!task.is_finished());
+    assert!(!state.accepting.load(Ordering::Acquire));
+    client.write_all(b"alive").await.unwrap();
+    let mut data = [0; 5];
+    upstream.read_exact(&mut data).await.unwrap();
+    assert_eq!(&data, b"alive");
+    assert!(state.bytes.load(Ordering::Relaxed) >= packet().len() as u64 + 5);
+    drop(blocker);
+    state.admission.send_replace(true);
+    wait_accepting(&state, true).await;
+    assert!(state.listener_error.read().unwrap().is_none());
+    drop(client);
+    drop(upstream);
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn idle_stream_expires_and_bytes_are_visible_before_close() {
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let state = state(
+        vec![endpoint("local", backend.local_addr().unwrap(), "node-a")],
+        false,
+    );
+    let ingress = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = ingress.local_addr().unwrap();
+    let mut opts = options(address);
+    opts.idle_timeout = Duration::from_millis(100);
+    let forward_state = state.clone();
+    let task = tokio::spawn(async move {
+        let (stream, _) = ingress.accept().await.unwrap();
+        router::forward(stream, forward_state, &opts).await
+    });
+    let mut client = TcpStream::connect(address).await.unwrap();
+    client.write_all(&packet()).await.unwrap();
+    let (mut stream, _) = backend.accept().await.unwrap();
+    let mut initial = vec![0; packet().len()];
+    stream.read_exact(&mut initial).await.unwrap();
+    assert_eq!(state.bytes.load(Ordering::Relaxed), packet().len() as u64);
+    stream.write_all(b"response").await.unwrap();
+    let mut reply = [0; 8];
+    client.read_exact(&mut reply).await.unwrap();
+    assert_eq!(
+        state.bytes.load(Ordering::Relaxed),
+        packet().len() as u64 + 8
+    );
+    let result = timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.unwrap_err().to_string().contains("inactivity"));
+    let mut byte = [0; 1];
+    assert_eq!(client.read(&mut byte).await.unwrap(), 0);
 }

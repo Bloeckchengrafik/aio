@@ -36,6 +36,7 @@ pub async fn kubernetes(
         ("discovery.k8s.io", "v1", "EndpointSlice", "endpointslices"),
     ];
     let (tx, mut rx) = mpsc::channel(32);
+    let mut workers = tokio::task::JoinSet::new();
     for (index, (group, version, kind, plural)) in resources.into_iter().enumerate() {
         let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(group, version, kind));
         let resource = ApiResource {
@@ -49,7 +50,7 @@ pub async fn kubernetes(
         };
         let tx = tx.clone();
         let cancel = cancel.clone();
-        tokio::spawn(async move {
+        workers.spawn(async move {
             let stream = watcher(api, watcher::Config::default()).default_backoff();
             tokio::pin!(stream);
             let mut objects = Objects::new();
@@ -57,7 +58,7 @@ pub async fn kubernetes(
             loop {
                 let event = tokio::select! { _ = cancel.cancelled() => break, event = stream.next() => event };
                 let Some(event) = event else {
-                    break;
+                    anyhow::bail!("watch {index} ended unexpectedly");
                 };
                 let update = match event {
                     Ok(watcher::Event::Init) => {
@@ -86,15 +87,22 @@ pub async fn kubernetes(
                     break;
                 }
             }
+            anyhow::Ok(())
         });
     }
     drop(tx);
     let mut caches: [Objects; 3] = Default::default();
     let mut synced = [false; 3];
     let mut errors: [Option<String>; 3] = Default::default();
+    let mut valid_routes = HashMap::new();
     loop {
-        let update =
-            tokio::select! { _ = cancel.cancelled() => break, update = rx.recv() => update };
+        let update = tokio::select! {
+            _ = cancel.cancelled() => break,
+            result=workers.join_next()=> {
+                match result {Some(Ok(Err(error)))=>return Err(error),Some(Err(error))=>anyhow::bail!("discovery worker failed: {error}"),_=>anyhow::bail!("discovery worker stopped")}
+            },
+            update = rx.recv() => update
+        };
         let Some(update) = update else {
             break;
         };
@@ -104,7 +112,11 @@ pub async fn kubernetes(
                 synced[i] = true;
                 errors[i] = None;
                 if synced.iter().all(|s| *s) {
-                    state.publish(build(&caches));
+                    let (routes, config_errors) =
+                        retain_valid_routes(&caches[0], &mut valid_routes);
+                    *state.config_errors.write().unwrap() = config_errors;
+                    state.publish(build(&[&routes, &caches[1], &caches[2]]));
+                    state.service_errors.write().unwrap().remove("discovery");
                 }
             }
             Update::Error(i, error) => {
@@ -125,9 +137,9 @@ fn key(object: &DynamicObject) -> String {
     )
 }
 
-fn build(caches: &[Objects; 3]) -> Snapshot {
+fn build(caches: &[&Objects; 3]) -> Snapshot {
     let mut routes = Vec::new();
-    for (id, value) in &caches[0] {
+    for (id, value) in caches[0] {
         let object: MinecraftRoute = match serde_json::from_value(value.clone()) {
             Ok(o) => o,
             Err(error) => {
@@ -239,6 +251,59 @@ fn build(caches: &[Objects; 3]) -> Snapshot {
     Snapshot { routes }.validate()
 }
 
+type ValidRoutes = HashMap<String, (String, Value)>;
+fn retain_valid_routes(
+    current: &Objects,
+    valid: &mut ValidRoutes,
+) -> (Objects, HashMap<String, String>) {
+    valid.retain(|id, _| current.contains_key(id));
+    let mut effective = Objects::new();
+    let mut errors = HashMap::new();
+    for (id, value) in current {
+        let uid = value["metadata"]["uid"].as_str().unwrap_or_default();
+        let validation = (|| -> anyhow::Result<()> {
+            let object: MinecraftRoute = serde_json::from_value(value.clone())?;
+            anyhow::ensure!(
+                object.spec.backend.port > 0 && !object.spec.backend.service.is_empty(),
+                "invalid backend reference"
+            );
+            let route = Route {
+                id: id.clone(),
+                hostnames: object.spec.hostnames,
+                proxy_protocol: object.spec.proxy_protocol,
+                endpoints: vec![],
+                errors: vec![],
+            };
+            let checked = Snapshot {
+                routes: vec![route],
+            }
+            .validate();
+            anyhow::ensure!(
+                checked.routes[0].errors.is_empty(),
+                "{}",
+                checked.routes[0].errors.join("; ")
+            );
+            Ok(())
+        })();
+        match validation {
+            Ok(()) => {
+                valid.insert(id.clone(), (uid.into(), value.clone()));
+                effective.insert(id.clone(), value.clone());
+            }
+            Err(error) => {
+                errors.insert(id.clone(), error.to_string());
+                if let Some((_, previous)) = valid.get(id).filter(|(old_uid, _)| old_uid == uid) {
+                    effective.insert(id.clone(), previous.clone());
+                } else {
+                    valid.remove(id);
+                    effective.insert(id.clone(), value.clone());
+                }
+            }
+        }
+    }
+    (effective, errors)
+}
+
 pub async fn local_file(
     state: Arc<State>,
     path: std::path::PathBuf,
@@ -252,9 +317,12 @@ pub async fn local_file(
                     Ok(snapshot) => {
                         let snapshot = snapshot.validate();
                         if snapshot.routes.iter().any(|r| !r.errors.is_empty()) {
-                            state.event("invalid local configuration; retaining previous snapshot");
+                            *state.watch_error.write().unwrap() = Some(
+                                "invalid local configuration; retaining previous snapshot".into(),
+                            );
                         } else {
                             state.publish(snapshot);
+                            state.service_errors.write().unwrap().remove("discovery");
                             *state.watch_error.write().unwrap() = None;
                             previous = contents;
                         }
@@ -278,12 +346,35 @@ pub async fn local_file(
 mod tests {
     use super::*;
     #[test]
+    fn malformed_update_retains_only_same_resources_last_valid_spec() {
+        let mut current = Objects::new();
+        let mut valid = ValidRoutes::new();
+        let original = serde_json::json!({"apiVersion":"akasha.asorda.net/v1alpha1","kind":"MinecraftRoute","metadata":{"name":"main","namespace":"asorda","uid":"first"},"spec":{"hostnames":["asorda.net"],"backend":{"service":"proxy","port":25565},"proxyProtocol":true}});
+        current.insert("asorda/main".into(), original.clone());
+        assert!(retain_valid_routes(&current, &mut valid).1.is_empty());
+        let mut malformed = original.clone();
+        malformed["spec"]["hostnames"] = serde_json::json!(["bad hostname"]);
+        current.insert("asorda/main".into(), malformed.clone());
+        let (effective, errors) = retain_valid_routes(&current, &mut valid);
+        assert_eq!(effective["asorda/main"], original);
+        assert!(errors.contains_key("asorda/main"));
+        malformed["metadata"]["uid"] = serde_json::json!("replacement");
+        current.insert("asorda/main".into(), malformed.clone());
+        assert_eq!(
+            retain_valid_routes(&current, &mut valid).0["asorda/main"],
+            malformed
+        );
+        assert!(!valid.contains_key("asorda/main"));
+        current.clear();
+        assert!(retain_valid_routes(&current, &mut valid).0.is_empty());
+    }
+    #[test]
     fn endpoint_slice_target_port_and_readiness() {
         let mut c: [Objects; 3] = Default::default();
         c[0].insert("asorda/main".into(),serde_json::json!({"apiVersion":"akasha.asorda.net/v1alpha1","kind":"MinecraftRoute","metadata":{"name":"main","namespace":"asorda"},"spec":{"hostnames":["asorda.net"],"backend":{"service":"proxy","port":25565},"proxyProtocol":true}}));
         c[1].insert("asorda/proxy".into(),serde_json::json!({"spec":{"clusterIP":"None","ports":[{"name":"mc","port":25565,"targetPort":25566}]}}));
         c[2].insert("slice".into(),serde_json::json!({"metadata":{"namespace":"asorda","labels":{"kubernetes.io/service-name":"proxy"}},"ports":[{"name":"mc","port":25566}],"endpoints":[{"addresses":["127.0.0.1"],"conditions":{"ready":true},"nodeName":"n1","targetRef":{"uid":"p1"}},{"addresses":["127.0.0.2"],"conditions":{"ready":false}}]}));
-        let snapshot = build(&c);
+        let snapshot = build(&[&c[0], &c[1], &c[2]]);
         assert!(snapshot.routes[0].errors.is_empty());
         assert_eq!(snapshot.routes[0].endpoints.len(), 1);
         assert_eq!(snapshot.routes[0].endpoints[0].address.port(), 25566);
