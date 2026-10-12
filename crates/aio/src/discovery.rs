@@ -147,8 +147,11 @@ fn build(caches: &[&Objects; 3]) -> Snapshot {
                     id: id.clone(),
                     hostnames: vec![],
                     proxy_protocol: false,
+                    allow_connections: true,
+                    fallback_status: Default::default(),
                     endpoints: vec![],
                     errors: vec![error.to_string()],
+                    backend_errors: vec![],
                 });
                 continue;
             }
@@ -159,16 +162,21 @@ fn build(caches: &[&Objects; 3]) -> Snapshot {
             id: id.clone(),
             hostnames: spec.hostnames,
             proxy_protocol: spec.proxy_protocol,
+            allow_connections: spec.allow_connections,
+            fallback_status: spec.fallback_status,
             endpoints: vec![],
             errors: vec![],
+            backend_errors: vec![],
         };
         let Some(service) = caches[1].get(&format!("{namespace}/{}", spec.backend.service)) else {
-            route.errors.push("backend Service missing".into());
+            route.backend_errors.push("backend Service missing".into());
             routes.push(route);
             continue;
         };
         if service.pointer("/spec/clusterIP").and_then(Value::as_str) != Some("None") {
-            route.errors.push("backend Service must be headless".into());
+            route
+                .backend_errors
+                .push("backend Service must be headless".into());
         }
         let ports = service
             .pointer("/spec/ports")
@@ -184,7 +192,7 @@ fn build(caches: &[&Objects; 3]) -> Snapshot {
             .collect();
         if ports.len() != 1 {
             route
-                .errors
+                .backend_errors
                 .push("Service port missing or ambiguous".into());
             routes.push(route);
             continue;
@@ -211,7 +219,7 @@ fn build(caches: &[&Objects; 3]) -> Snapshot {
                 .filter(|p| *p > 0 && *p <= 65535)
             else {
                 route
-                    .errors
+                    .backend_errors
                     .push("EndpointSlice port missing or ambiguous".into());
                 continue;
             };
@@ -246,6 +254,9 @@ fn build(caches: &[&Objects; 3]) -> Snapshot {
                 }
             }
         }
+        if !route.backend_errors.is_empty() {
+            route.endpoints.clear();
+        }
         routes.push(route);
     }
     Snapshot { routes }.validate()
@@ -271,8 +282,11 @@ fn retain_valid_routes(
                 id: id.clone(),
                 hostnames: object.spec.hostnames,
                 proxy_protocol: object.spec.proxy_protocol,
+                allow_connections: object.spec.allow_connections,
+                fallback_status: object.spec.fallback_status,
                 endpoints: vec![],
                 errors: vec![],
+                backend_errors: vec![],
             };
             let checked = Snapshot {
                 routes: vec![route],
@@ -378,5 +392,12 @@ mod tests {
         assert!(snapshot.routes[0].errors.is_empty());
         assert_eq!(snapshot.routes[0].endpoints.len(), 1);
         assert_eq!(snapshot.routes[0].endpoints[0].address.port(), 25566);
+        c[1].clear();
+        let missing = build(&[&c[0], &c[1], &c[2]]);
+        let route = missing
+            .resolve("asorda.net")
+            .expect("known hostname still serves fallback after Service loss");
+        assert!(route.endpoints.is_empty());
+        assert_eq!(route.backend_errors, ["backend Service missing"]);
     }
 }

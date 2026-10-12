@@ -67,9 +67,9 @@ def main():
             url = f"{dashboard_url}/api/instances/smoke"
             result = json.loads(request(f"{url}/resolve", None, {"hostname": "PLAY.Asorda.Net."}))
             assert result["routeId"] == "demo/main" and not result["proxyProtocol"]
-            result = json.loads(request(f"{url}/admission", None, {"accepting": False, "reason": "smoke pause"}))
+            result = json.loads(request(f"{url}/admission", None, {"accepting": False}))
             assert not result["accepting"]
-            result = json.loads(request(f"{url}/admission", None, {"accepting": True, "reason": "smoke resume"}))
+            result = json.loads(request(f"{url}/admission", None, {"accepting": True}))
             assert result["accepting"]
             print("Agent + dashboard smoke passed: static UI, proxy-authenticated dashboard aggregation, hostname debug, pause/resume.")
         finally:

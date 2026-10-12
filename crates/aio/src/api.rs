@@ -23,6 +23,7 @@ pub fn routes(state: Arc<AgentState>, token: String) -> Router {
         .route("/api/v1/events", get(events))
         .route("/api/v1/debug/resolve", post(resolve))
         .route("/api/v1/admission", post(admission))
+        .route("/api/v1/routes/control", post(route_control))
         .route("/api/v1/endpoints/exclude", post(exclude))
         .route("/api/v1/endpoints/reset", post(reset))
         .route("/metrics", get(metrics))
@@ -78,7 +79,7 @@ async fn status(State(s): State<Arc<AgentState>>) -> Json<serde_json::Value> {
 async fn routes_view(State(s): State<Arc<AgentState>>) -> Json<serde_json::Value> {
     let snapshot = s.snapshot.read().unwrap().clone();
     Json(
-        serde_json::json!({"generation":s.generation.load(Ordering::Relaxed),"routes":snapshot.routes}),
+        serde_json::json!({"generation":s.generation.load(Ordering::Relaxed),"routes":snapshot.routes.iter().map(|r| s.route_view(r)).collect::<Vec<_>>()}),
     )
 }
 async fn endpoints(State(s): State<Arc<AgentState>>) -> Json<serde_json::Value> {
@@ -103,7 +104,7 @@ async fn resolve(
     let snapshot = s.snapshot.read().unwrap().clone();
     Ok(Json(match snapshot.resolve(&host) {
         Some(r) => {
-            serde_json::json!({"hostname":host,"routeId":r.id,"proxyProtocol":r.proxy_protocol,"candidates":r.endpoints.iter().map(|e|serde_json::json!({"id":e.id,"local":e.node_name.as_deref()==Some(&s.node),"usable":s.usable(e)})).collect::<Vec<_>>() })
+            serde_json::json!({"hostname":host,"routeId":r.id,"admission":s.route_view(r)["admission"],"proxyProtocol":r.proxy_protocol,"candidates":r.endpoints.iter().map(|e|serde_json::json!({"id":e.id,"local":e.node_name.as_deref()==Some(&s.node),"usable":s.usable(e)})).collect::<Vec<_>>() })
         }
         None => serde_json::json!({"hostname":host,"routeId":null,"candidates":[]}),
     }))
@@ -113,25 +114,66 @@ async fn resolve(
 struct Admission {
     instance_id: String,
     accepting: bool,
-    reason: String,
 }
-fn validate(s: &AgentState, instance: &str, reason: &str) -> Result<(), Error> {
+fn validate(s: &AgentState, instance: &str) -> Result<(), Error> {
     if instance != s.instance {
         return Err((StatusCode::CONFLICT, "instance changed".into()));
     }
-    if reason.trim().is_empty() || reason.len() > 256 {
+    Ok(())
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RouteAction {
+    instance_id: String,
+    route_id: String,
+    action: String,
+}
+async fn route_control(
+    State(s): State<Arc<AgentState>>,
+    Json(body): Json<RouteAction>,
+) -> Result<Json<serde_json::Value>, Error> {
+    validate(&s, &body.instance_id)?;
+    if !matches!(body.action.as_str(), "allow" | "stop" | "kill") {
+        return Err((StatusCode::BAD_REQUEST, "unknown route action".into()));
+    }
+    let mut controls = s.route_controls.lock().unwrap();
+    let snapshot = s.snapshot.read().unwrap();
+    let route = snapshot
+        .routes
+        .iter()
+        .find(|r| r.id == body.route_id)
+        .ok_or((StatusCode::NOT_FOUND, "route not found".into()))?;
+    if body.action == "allow" && !route.allow_connections {
         return Err((
-            StatusCode::BAD_REQUEST,
-            "reason must contain 1–256 bytes".into(),
+            StatusCode::CONFLICT,
+            "MinecraftRoute disables connections; change allowConnections first".into(),
         ));
     }
-    Ok(())
+    let c = controls.entry(body.route_id.clone()).or_default();
+    c.blocked = body.action != "allow";
+    let disconnected = if body.action == "kill" {
+        for token in c.sessions.values() {
+            token.cancel();
+        }
+        c.sessions.len()
+    } else {
+        0
+    };
+    drop(snapshot);
+    drop(controls);
+    s.event(format!(
+        "operator route={} action={} disconnectRequested={disconnected}",
+        body.route_id, body.action
+    ));
+    Ok(Json(
+        serde_json::json!({"ok":true,"disconnectRequested":disconnected}),
+    ))
 }
 async fn admission(
     State(s): State<Arc<AgentState>>,
     Json(body): Json<Admission>,
 ) -> Result<Json<serde_json::Value>, Error> {
-    validate(&s, &body.instance_id, &body.reason)?;
+    validate(&s, &body.instance_id)?;
     let _operation = s.admission_operation.lock().await;
     if s.terminating.load(Ordering::Acquire) || !s.synced.load(Ordering::Acquire) {
         return Err((
@@ -166,8 +208,8 @@ async fn admission(
     .await;
     let confirmed = matches!(confirmed, Ok(Ok(())));
     s.event(format!(
-        "operator admission={} reason={} confirmed={confirmed}",
-        body.accepting, body.reason
+        "operator admission={} confirmed={confirmed}",
+        body.accepting
     ));
     if !confirmed {
         return Err((
@@ -182,7 +224,6 @@ async fn admission(
 struct EndpointAction {
     instance_id: String,
     endpoint_id: String,
-    reason: String,
     #[serde(default)]
     ttl_seconds: u64,
 }
@@ -198,7 +239,7 @@ async fn exclude(
     State(s): State<Arc<AgentState>>,
     Json(body): Json<EndpointAction>,
 ) -> Result<Json<serde_json::Value>, Error> {
-    validate(&s, &body.instance_id, &body.reason)?;
+    validate(&s, &body.instance_id)?;
     if body.ttl_seconds > 86400 {
         return Err((StatusCode::BAD_REQUEST, "TTL exceeds 24h".into()));
     }
@@ -210,10 +251,10 @@ async fn exclude(
         .unwrap()
         .entry(body.endpoint_id.clone())
         .or_default()
-        .exclude(body.ttl_seconds, body.reason.clone());
+        .exclude(body.ttl_seconds, String::new());
     s.event(format!(
-        "operator exclusion endpoint={} ttl={} reason={}",
-        body.endpoint_id, body.ttl_seconds, body.reason
+        "operator exclusion endpoint={} ttl={}",
+        body.endpoint_id, body.ttl_seconds
     ));
     Ok(Json(serde_json::json!({"ok":true})))
 }
@@ -221,7 +262,7 @@ async fn reset(
     State(s): State<Arc<AgentState>>,
     Json(body): Json<EndpointAction>,
 ) -> Result<Json<serde_json::Value>, Error> {
-    validate(&s, &body.instance_id, &body.reason)?;
+    validate(&s, &body.instance_id)?;
     if !endpoint_exists(&s, &body.endpoint_id) {
         return Err((StatusCode::NOT_FOUND, "endpoint not found".into()));
     }
@@ -231,10 +272,7 @@ async fn reset(
         .entry(body.endpoint_id.clone())
         .or_default()
         .reset();
-    s.event(format!(
-        "operator reset endpoint={} reason={}",
-        body.endpoint_id, body.reason
-    ));
+    s.event(format!("operator reset endpoint={}", body.endpoint_id));
     Ok(Json(serde_json::json!({"ok":true})))
 }
 async fn metrics(State(s): State<Arc<AgentState>>) -> String {
