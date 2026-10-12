@@ -1,4 +1,7 @@
-use crate::model::{Endpoint, Snapshot};
+use crate::{
+    model::{Endpoint, Snapshot},
+    notifications::{Kind, Notification, Notifier},
+};
 use serde::Serialize;
 use std::{
     collections::{HashMap, VecDeque},
@@ -20,6 +23,8 @@ pub struct Event {
 #[derive(Default)]
 pub struct Circuit {
     failures: u32,
+    // Remains latched across cooldowns and manual reset until a real success.
+    outage: bool,
     opened_until: Option<Instant>,
     probe: bool,
     cooldown: u64,
@@ -45,13 +50,17 @@ impl Circuit {
         }
         true
     }
-    pub fn success(&mut self) {
+    pub fn success(&mut self) -> bool {
+        let recovered = self.outage;
+        self.outage = false;
         self.failures = 0;
         self.opened_until = None;
         self.probe = false;
         self.cooldown = 0;
+        recovered
     }
-    pub fn failure(&mut self) {
+    pub fn failure(&mut self) -> bool {
+        let mut opened = false;
         self.failures += 1;
         if self.probe || self.failures >= 3 {
             self.cooldown = if self.cooldown == 0 {
@@ -59,15 +68,20 @@ impl Circuit {
             } else {
                 (self.cooldown * 2).min(60)
             };
+            opened = !self.outage;
+            self.outage = true;
             self.opened_until = Some(Instant::now() + Duration::from_secs(self.cooldown));
         }
         self.probe = false;
+        opened
     }
     pub fn release(&mut self) {
         self.probe = false;
     }
     pub fn reset(&mut self) {
+        let outage = self.outage;
         self.success();
+        self.outage = outage;
     }
     pub fn exclude(&mut self, seconds: u64, reason: String) {
         self.exclusion =
@@ -105,6 +119,7 @@ impl Drop for RouteSession {
 }
 
 pub struct State {
+    pub notifications: Notifier,
     pub route_controls: Mutex<HashMap<String, RouteControl>>,
     session_sequence: AtomicU64,
     pub started: Instant,
@@ -139,6 +154,7 @@ impl State {
     pub fn new(node: String, instance: String) -> Arc<Self> {
         let (admission, _) = watch::channel(true);
         Arc::new(Self {
+            notifications: Notifier::default(),
             route_controls: Mutex::new(HashMap::new()),
             session_sequence: AtomicU64::new(0),
             started: Instant::now(),
@@ -267,6 +283,33 @@ impl State {
             message,
         });
     }
+    pub fn circuit_result(&self, route: &str, endpoint: &Endpoint, success: bool) {
+        let mut circuits = self.circuits.lock().unwrap();
+        let circuit = circuits.entry(endpoint.id.clone()).or_default();
+        let changed = if success {
+            circuit.success()
+        } else {
+            circuit.failure()
+        };
+        if changed {
+            let kind = if success {
+                Kind::CircuitRecovered
+            } else {
+                Kind::CircuitOpened
+            };
+            let mut notification = Notification::new(kind, route, &self.node, &self.instance);
+            notification.backend = Some(endpoint.id.clone());
+            notification.failures = circuit.failures;
+            notification.cooldown = circuit.cooldown;
+            self.event(format!(
+                "backend circuit {} route={route} endpoint={} cooldown={}s",
+                if success { "recovered" } else { "opened" },
+                endpoint.id,
+                circuit.cooldown
+            ));
+            self.notifications.send(notification);
+        }
+    }
     pub fn usable(&self, endpoint: &Endpoint) -> bool {
         self.circuits
             .lock()
@@ -274,9 +317,65 @@ impl State {
             .get(&endpoint.id)
             .is_none_or(Circuit::available)
     }
+    pub fn circuit_metrics(&self) -> String {
+        use std::fmt::Write;
+        let snapshot = self.snapshot.read().unwrap().clone();
+        let circuits = self.circuits.lock().unwrap();
+        let now = Instant::now();
+        let mut output = String::from(
+            "# HELP aio_backend_circuit_state One-hot circuit state; half_open includes waiting for a trial.\n# TYPE aio_backend_circuit_state gauge\n# TYPE aio_backend_circuit_cooldown_seconds gauge\n# TYPE aio_backend_circuit_failures gauge\n# TYPE aio_backend_excluded gauge\n# TYPE aio_backend_exclusion_remaining_seconds gauge\n",
+        );
+        let endpoints: std::collections::BTreeMap<_, _> = snapshot
+            .routes
+            .iter()
+            .flat_map(|r| r.endpoints.iter().map(move |e| ((&r.id, &e.id), e)))
+            .collect();
+        for ((route, id), _) in endpoints {
+            let default = Circuit::default();
+            let circuit = circuits.get(id).unwrap_or(&default);
+            let state = if circuit.probe {
+                "half_open"
+            } else if circuit.opened_until.is_some_and(|t| t > now) {
+                "open"
+            } else if circuit.opened_until.is_some() {
+                "half_open"
+            } else {
+                "closed"
+            };
+            let labels = format!(
+                "route=\"{}\",endpoint=\"{}\"",
+                metric_label(route),
+                metric_label(id)
+            );
+            for name in ["closed", "open", "half_open"] {
+                writeln!(
+                    output,
+                    "aio_backend_circuit_state{{{labels},state=\"{name}\"}} {}",
+                    u8::from(state == name)
+                )
+                .unwrap();
+            }
+            let cooldown = circuit
+                .opened_until
+                .map_or(0.0, |t| t.saturating_duration_since(now).as_secs_f64());
+            let exclusion = circuit
+                .exclusion
+                .as_ref()
+                .map_or(0.0, |(t, _)| t.saturating_duration_since(now).as_secs_f64());
+            writeln!(output, "aio_backend_circuit_cooldown_seconds{{{labels}}} {cooldown}\naio_backend_circuit_failures{{{labels}}} {}\naio_backend_excluded{{{labels}}} {}\naio_backend_exclusion_remaining_seconds{{{labels}}} {exclusion}", circuit.failures, u8::from(exclusion > 0.0)).unwrap();
+        }
+        output
+    }
     pub fn status(&self) -> serde_json::Value {
         serde_json::json!({"instanceId":self.instance,"nodeName":self.node,"version":env!("CARGO_PKG_VERSION"),"synced":self.synced.load(Ordering::Acquire),"accepting":self.accepting.load(Ordering::Acquire),"terminating":self.terminating.load(Ordering::Acquire),"generation":self.generation.load(Ordering::Relaxed),"activeConnections":self.active.load(Ordering::Relaxed),"watchError":*self.watch_error.read().unwrap(),"serviceErrors":*self.service_errors.read().unwrap(),"listenerError":*self.listener_error.read().unwrap(),"configErrors":*self.config_errors.read().unwrap(),"fileDescriptorLimit":self.fd_limit.load(Ordering::Relaxed),"uptimeSeconds":self.started.elapsed().as_secs(),"counters":{"localSelections":self.local.load(Ordering::Relaxed),"globalSelections":self.global.load(Ordering::Relaxed),"connections":self.total.load(Ordering::Relaxed),"errors":self.failures.load(Ordering::Relaxed),"bytes":self.bytes.load(Ordering::Relaxed)}})
     }
+}
+
+fn metric_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[cfg(test)]
@@ -296,6 +395,51 @@ mod tests {
         assert!(!c.available());
         c.exclude(0, String::new());
         assert!(c.available());
+    }
+    #[test]
+    fn metrics_track_state_exclusion_and_removed_endpoints() {
+        use crate::model::Route;
+        let state = State::new("node".into(), "instance".into());
+        let endpoint = Endpoint {
+            id: "pod\"\\\nendpoint".into(),
+            address: "127.0.0.1:25566".parse().unwrap(),
+            node_name: None,
+        };
+        state.publish(Snapshot {
+            routes: vec![Route {
+                id: "test/main".into(),
+                hostnames: vec!["example.test".into()],
+                proxy_protocol: false,
+                allow_connections: true,
+                fallback_status: Default::default(),
+                endpoints: vec![endpoint.clone()],
+                errors: vec![],
+                backend_errors: vec![],
+            }],
+        });
+        let closed = state.circuit_metrics();
+        assert!(closed.contains("state=\"closed\"} 1"));
+        assert!(closed.contains("endpoint=\"pod\\\"\\\\\\nendpoint\""));
+        for _ in 0..3 {
+            state.circuit_result("test/main", &endpoint, false);
+        }
+        assert!(state.circuit_metrics().contains("state=\"open\"} 1"));
+        {
+            let mut circuits = state.circuits.lock().unwrap();
+            let c = circuits.get_mut(&endpoint.id).unwrap();
+            c.opened_until = Some(Instant::now());
+            c.exclude(60, String::new());
+        }
+        let trial = state.circuit_metrics();
+        assert!(trial.contains("state=\"half_open\"} 1"));
+        assert!(trial.contains(
+            "aio_backend_excluded{route=\"test/main\",endpoint=\"pod\\\"\\\\\\nendpoint\"} 1"
+        ));
+        state.circuit_result("test/main", &endpoint, true);
+        assert!(state.circuit_metrics().contains("state=\"closed\"} 1"));
+        assert!(!state.usable(&endpoint));
+        state.publish(Snapshot::default());
+        assert!(!state.circuit_metrics().contains("test/main"));
     }
     #[test]
     fn half_open_has_only_one_trial() {

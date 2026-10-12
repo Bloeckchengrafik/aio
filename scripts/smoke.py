@@ -49,6 +49,7 @@ def main():
         agents = Path(directory) / "agents.yaml"
         agents.write_text(f"- instanceId: smoke\n  url: {agent_url}\n")
         env = os.environ | {"AIO_API_TOKEN": "smoke-agent"}
+        env.pop("AIO_DISCORD_WEBHOOK_URL", None)
         try:
             processes.append(subprocess.Popen([str(ROOT / "target/debug/aio-agent"), "--config", str(ROOT / "examples/local.yaml"), "--instance-id", "smoke", "--listen", f"127.0.0.1:{ingress}", "--management-listen", f"127.0.0.1:{management}", "--drain-timeout-seconds", "1"], env=env, cwd=ROOT, stdout=subprocess.DEVNULL))
             wait(f"{agent_url}/health/ready")
@@ -61,6 +62,11 @@ def main():
                 raise AssertionError("agent accepted anonymous access")
             except urllib.error.HTTPError as error:
                 assert error.code == 401
+            metrics = request(f"{agent_url}/metrics", "smoke-agent").decode()
+            assert 'aio_backend_circuit_state{route="demo/main",endpoint="demo-proxy/127.0.0.1:25566",state="closed"} 1' in metrics
+            assert "aio_backend_circuit_cooldown_seconds" in metrics
+            assert "aio_backend_excluded" in metrics
+            assert "aio_discord_enabled 0" in metrics
             fleet = json.loads(request(f"{dashboard_url}/api/instances"))
             assert fleet["instances"][0]["reachable"]
             assert fleet["instances"][0]["data"]["status"]["accepting"]
@@ -71,7 +77,7 @@ def main():
             assert not result["accepting"]
             result = json.loads(request(f"{url}/admission", None, {"accepting": True}))
             assert result["accepting"]
-            print("Agent + dashboard smoke passed: static UI, proxy-authenticated dashboard aggregation, hostname debug, pause/resume.")
+            print("Agent + dashboard smoke passed: static UI, proxy-authenticated dashboard aggregation, hostname debug, pause/resume, circuit/notification metrics.")
         finally:
             for process in reversed(processes):
                 process.terminate()

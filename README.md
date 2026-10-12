@@ -121,3 +121,29 @@ The dashboard groups rollout instances by node, exposes configuration/watch erro
 `MinecraftRoute.spec.allowConnections: false` persists maintenance across agent restarts. The route page provides runtime Stop, Allow and Kill controls for a selected instance or all current instances (including draining); each target has an independent result. Stop preserves existing players. Kill blocks new logins and disconnects route sessions. Runtime controls are transient and Allow cannot override declarative maintenance.
 
 Configure `fallbackStatus` on the route (see `deploy/route.yaml`): maintenance and unavailable MOTDs, version labels, optional base64-encoded 64×64 PNG favicon, and numeric protocol (default -1). AIO forwards fresh healthy status responses; backend loss or status errors use the unavailable response. Fallback player counts are zero. Ping latency always measures AIO. No response cache is used.
+
+### Circuit metrics and Discord notifications
+
+Authenticated agent `/metrics` now exposes per-route/backend gauges, including healthy endpoints that have never failed. Labels are `route` (namespace/name) and `endpoint` (discovered backend ID); scrape-target labels identify the agent/node. Removed endpoints disappear from the next scrape.
+
+| Metric | Meaning |
+| --- | --- |
+| `aio_backend_circuit_state{state="closed\|open\|half_open"}` | Three one-hot state series; half-open includes waiting for a trial |
+| `aio_backend_circuit_cooldown_seconds` | Remaining cooldown, zero when a trial is eligible |
+| `aio_backend_circuit_failures` | Consecutive failure count; gauge, not counter |
+| `aio_backend_excluded` | 1 while a manual exclusion is active |
+| `aio_backend_exclusion_remaining_seconds` | Remaining manual exclusion TTL |
+
+To alert while a circuit remains open or awaiting recovery, retain the same alert identity across cooldown/trial transitions:
+
+```promql
+sum without (state) (aio_backend_circuit_state{state=~"open|half_open"}) > 0
+```
+
+Configure optional `AIO_DISCORD_WEBHOOK_URL` on each agent with an HTTPS Discord webhook URL. `deploy/agent.yaml` reads the optional `discord-webhook-url` key from the existing `aio-management` Secret. Leave that key absent to disable delivery. The URL stays out of agent APIs and AIO logs; redirects are disabled and mentions are suppressed. No webhook credential belongs in MinecraftRoute or the browser. The worker adds `wait=true` so a successful response acknowledges message creation.
+
+Events are circuit **opened**, circuit **recovered**, and effective route **Stop/Allow/Kill** actions. Messages identify the triggering route/backend, node and instance, with failure/cooldown or session counts. An outage produces one opening notification; repeated failures and failed half-open trials are suppressed until a real successful backend connect/status response generates recovery. Manual Reset enables a new attempt and never claims recovery by itself. A later outage can notify again. Idempotent Stop/Allow, or a repeated Kill with no remaining sessions, produces no extra message. Declarative configuration updates are not operator-action notifications.
+
+Each agent delivers independently, including draining agents: different node perspectives are intentional. There is no centralized deduplication or cross-agent ordering. Delivery is best-effort and transient: a 128-event queue uses nonblocking enqueue, a single background worker, three-second request timeouts, at most three attempts per event, and a 60-second event lifetime. Network failures and 5xx retry with backoff; 429 respects `Retry-After`/`retry_after` and successful exhausted buckets respect `X-RateLimit-Reset-After`. Other non-success responses are not retried. Full/expired queues drop events; shutdown cancels the worker after ingress draining. Retries after an ambiguous network failure may duplicate a message. There is no durable delivery guarantee.
+
+`aio_discord_enabled`, `aio_discord_notification_queue_depth`, and `aio_discord_notifications_total{result="delivered|failed|dropped"}` expose configuration and delivery health without exposing the URL. No Discord availability affects route admission, readiness or liveness. Tests use a local mock endpoint and do not send real Discord messages. See Discord's [rate-limit contract](https://github.com/discord/discord-api-docs/blob/main/developers/topics/rate-limits.mdx).
