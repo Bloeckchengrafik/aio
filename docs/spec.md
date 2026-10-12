@@ -151,7 +151,7 @@ Deploy a small centralized web application, with a Svelte frontend and a thin se
 
 Use a Traefik-style overview: instance health and version, active connections, routes, local/global endpoint availability, circuit states, conflicts and watch errors. Show route details per instance because locality and cached configuration may differ. Include hostname resolution debugging, recent bounded events, and explicit pause/resume, endpoint exclusion and circuit reset controls. No route editor: GitOps/Helm remains authoritative.
 
-Authenticate users through the existing Keycloak setup and authorize view versus operate access server-side. Mutations require an authenticated operator, CSRF protection where cookie authentication is used, and a reason. Operator actions preview the selected instances; fan-out returns per-instance results, including timeouts. No implicit all-node pause or transactional cluster-wide guarantee.
+Authenticate browser users through the existing Traefik traefik-oidc-auth middleware on the entire dashboard hostname. AIO implements no separate OIDC flow or browser bearer-token login. All users admitted by that middleware initially have operator access; role separation can be added at that boundary. Restrict direct dashboard access. JSON POSTs require a same-origin request marker, reject cross-site Fetch Metadata and enforce the configured public Origin. Mutations require an operator reason; optionally use trusted X-Aio-User claim headers for dashboard operation logs. Operator actions preview the selected instances; fan-out returns per-instance results, including timeouts. No implicit all-node pause or transactional cluster-wide guarantee.
 
 Poll at a modest interval (default 5 seconds) with bounded concurrency, per-agent timeouts and backoff for unreachable agents. Retain stale/removed registrations for up to 24 hours in memory and reject mutations to them. Display last-observed timestamps and stale/unreachable/draining states; stale values must not look healthy. Discover both versions during surge updates by Pod UID, not just node name. Agent management ports are protected by host firewall/private-network controls; host-network isolation must not be assumed from ordinary pod NetworkPolicy alone.
 
@@ -176,7 +176,7 @@ Log route validation/conflict errors with namespace/name. Defer MinecraftRoute s
 - Graceful shutdown stops admission and drains within the configured deadline.
 - Circuit thresholds, bounded half-open trials, cooldown, local/global fallback and endpoint identity changes behave deterministically under concurrent connections.
 - Debug resolution is side-effect free; exclusions and resets respect readiness, TTL and expected instance identity.
-- Dashboard authentication and view/operate authorization are enforced; actions expose partial failure and generate audit events.
+- The configured Traefik middleware protects dashboard web/API requests; caller-supplied identity headers are stripped before claim injection, and same-origin JSON POST defenses are enforced. Actions expose errors and generate operation logs.
 - Dashboard/agent-management outages do not interrupt routing; unreachable or stale instances are clearly shown.
 - Babylon/AIO crashes have the documented disconnect behaviour; new connections can use surviving instances.
 

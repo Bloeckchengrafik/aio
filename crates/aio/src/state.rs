@@ -80,6 +80,7 @@ impl Circuit {
 }
 
 pub struct State {
+    pub started: Instant,
     pub node: String,
     pub instance: String,
     pub snapshot: RwLock<Arc<Snapshot>>,
@@ -111,6 +112,7 @@ impl State {
     pub fn new(node: String, instance: String) -> Arc<Self> {
         let (admission, _) = watch::channel(true);
         Arc::new(Self {
+            started: Instant::now(),
             node,
             instance,
             snapshot: RwLock::new(Arc::new(Snapshot::default())),
@@ -176,7 +178,7 @@ impl State {
             .is_none_or(Circuit::available)
     }
     pub fn status(&self) -> serde_json::Value {
-        serde_json::json!({"instanceId":self.instance,"nodeName":self.node,"version":env!("CARGO_PKG_VERSION"),"synced":self.synced.load(Ordering::Acquire),"accepting":self.accepting.load(Ordering::Acquire),"terminating":self.terminating.load(Ordering::Acquire),"generation":self.generation.load(Ordering::Relaxed),"activeConnections":self.active.load(Ordering::Relaxed),"watchError":*self.watch_error.read().unwrap(),"serviceErrors":*self.service_errors.read().unwrap(),"listenerError":*self.listener_error.read().unwrap(),"configErrors":*self.config_errors.read().unwrap(),"fileDescriptorLimit":self.fd_limit.load(Ordering::Relaxed)})
+        serde_json::json!({"instanceId":self.instance,"nodeName":self.node,"version":env!("CARGO_PKG_VERSION"),"synced":self.synced.load(Ordering::Acquire),"accepting":self.accepting.load(Ordering::Acquire),"terminating":self.terminating.load(Ordering::Acquire),"generation":self.generation.load(Ordering::Relaxed),"activeConnections":self.active.load(Ordering::Relaxed),"watchError":*self.watch_error.read().unwrap(),"serviceErrors":*self.service_errors.read().unwrap(),"listenerError":*self.listener_error.read().unwrap(),"configErrors":*self.config_errors.read().unwrap(),"fileDescriptorLimit":self.fd_limit.load(Ordering::Relaxed),"uptimeSeconds":self.started.elapsed().as_secs(),"counters":{"localSelections":self.local.load(Ordering::Relaxed),"globalSelections":self.global.load(Ordering::Relaxed),"connections":self.total.load(Ordering::Relaxed),"errors":self.failures.load(Ordering::Relaxed),"bytes":self.bytes.load(Ordering::Relaxed)}})
     }
 }
 

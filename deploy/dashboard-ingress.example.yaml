@@ -1,0 +1,55 @@
+# Adjust hostname/TLS secret and the existing traefik-oidc-auth Middleware reference.
+# Protect the entire hostname, including /api and the middleware's callback path.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: aio-dashboard
+  namespace: aio-system
+spec:
+  entryPoints: [websecure]
+  routes:
+    - kind: Rule
+      match: Host(`aio.asorda.net`)
+      middlewares:
+        - name: aio-strip-identity
+        - name: oidc-auth
+          namespace: traefik
+      services:
+        - name: aio-dashboard
+          port: 8080
+  tls:
+    secretName: aio-dashboard-tls
+---
+# Remove caller-supplied identity before the OIDC middleware adds its trusted claim header.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: aio-strip-identity
+  namespace: aio-system
+spec:
+  headers:
+    customRequestHeaders:
+      X-Aio-User: ''
+---
+# This ingress policy is an example: match your Traefik namespace/pod labels.
+# Verify CNI enforcement and any host-network bypasses on your installation.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aio-dashboard-ingress
+  namespace: aio-system
+spec:
+  podSelector:
+    matchLabels: {app: aio-dashboard}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - port: 8080
+          protocol: TCP

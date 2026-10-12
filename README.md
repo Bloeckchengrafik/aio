@@ -21,11 +21,11 @@ AIO_API_TOKEN=local-agent-token cargo run --bin aio-agent -- \
   --management-listen 127.0.0.1:18080
 
 # In another terminal; agent credentials stay server-side.
-AIO_API_TOKEN=local-agent-token AIO_DASHBOARD_TOKEN=local-dashboard-token \
+AIO_API_TOKEN=local-agent-token \
   cargo run --bin aio-dashboard -- --agents examples/agents.yaml
 ```
 
-Open http://127.0.0.1:8080 and enter the dashboard token. Tokens are supplied through environment variables; the UI keeps its dashboard token in memory. Example strings above are for local testing only. Restrict management reachability and terminate TLS before remote use.
+Open http://127.0.0.1:8080. The dashboard has no built-in login: production authentication is provided by your existing Traefik `traefik-oidc-auth` middleware. Only the internal dashboard-to-agent bearer credential is retained; it never reaches the browser. Local defaults bind to loopback. Open `/?demo` for an explicitly labeled, read-only visual preview using illustrative data.
 
 The local YAML is reloaded every two seconds; invalid edits retain the prior valid snapshot. It supplies explicit ready endpoints to exercise routing without Kubernetes. `proxyProtocol: false` sends plain Minecraft bytes; `true` prepends exactly one v2 header. Backend configuration must agree. Hostname matching uses exact routes first, then the longest wildcard suffix. Conflicting claims disable all owning routes.
 
@@ -62,11 +62,11 @@ The agent registration namespace is separate from the route namespace. Managemen
 - Existing streams are not migrated. Agent, node or Babylon crashes disconnect their sessions.
 - The dashboard supports instance status, routes, circuits, events, side-effect-free hostname resolution, pause/resume, exclusions and reset. It affects no traffic when unavailable.
 
-All management data/API operations require a bearer token; only health endpoints are unauthenticated. The dashboard has a separate token and forwards agent credentials server-side. Mutation bodies require the current instance ID and an operator reason. This prototype has a single operator permission level.
+Agent management data/API operations require a bearer token; only agent health endpoints are unauthenticated. Dashboard web/API requests rely on Traefik authentication and are not independently authenticated by AIO. Mutation bodies require the current instance ID and an operator reason. This prototype has a single operator permission level.
 
 ## Prototype limits / next work
 
-- Keycloak OIDC, separate view/operate roles, actor-attributed durable audit and production TLS integration are not implemented. Current events are bounded in-memory operation records.
+- All users admitted by the configured Traefik middleware have operator access. Separate view/operate roles and durable audit storage are not implemented; optional trusted identity headers attribute dashboard operation logs. TLS/OIDC remain ingress responsibilities.
 - Invalid Kubernetes route specs retain their prior valid spec only for the same resource UID. Errors remain visible through status. Deletion or recreation clears history; cold starts use current resources. Missing backends and conflicting hostnames remain unavailable rather than overriding readiness or conflict checks.
 - Dashboard stale-history inventory is transient and is lost on dashboard restart. Pagination and configurable poll backoff are still pending.
 - Resource limits bound total connections and per-handshake buffers; there is no separate global byte-budget allocator. Relay buffers use Tokio's bounded copy buffers.
@@ -83,6 +83,8 @@ cargo test --locked
 cd web
 npm run check
 npm run build
+npx playwright install chromium
+npm run test:ui
 cd ..
 cargo build --locked --bins
 python3 scripts/smoke.py
@@ -92,3 +94,24 @@ python3 scripts/fd_exhaustion.py
 Tests cover route precedence/conflicts, fragmented handshakes, framing, EndpointSlice port mapping, last-valid spec retention, circuit transitions, reserved global fallback, PROXY v2 on/off, management authentication, worker panic recovery, stale registration handling, failed resume, live byte accounting, idle expiry and same-node listener overlap. The Linux subprocess regression deliberately exhausts descriptors and verifies established-stream continuity and management recovery.
 
 Build both binaries and UI into the provided container with `docker build -t aio:prototype .`; override its command to `/usr/local/bin/aio-dashboard` for the dashboard deployment.
+
+## Traefik authentication boundary
+
+Use `deploy/dashboard-ingress.example.yaml` as an edited example, referencing your existing `traefik-oidc-auth` Middleware. Protect the complete dashboard hostname, including `/api/*` and the OIDC callback route; do not create an unauthenticated API route. Cross-namespace Middleware references require Traefik's corresponding setting, or place the Middleware in aio-system instead. Match `AIO_PUBLIC_ORIGIN` in the Deployment to the public origin (scheme + host + optional port, no trailing slash).
+
+Keep the dashboard Service private. The included NetworkPolicy example permits only the configured Traefik namespace/pod labels; adjust them and verify enforcement for your CNI and host-network setup. Direct backend access bypasses OIDC. No authentication is inferred merely from the presence of a header.
+
+POSTs require JSON and the `X-AIO-Request: 1` marker. Cross-site Fetch Metadata is rejected; when `AIO_PUBLIC_ORIGIN` is configured, an exact matching Origin is also required. The frontend sends same-origin session cookies and never uses CORS. Machine clients must supply the same marker/content type and configured Origin. Expired sessions are shown with a reauthentication link rather than a second login form.
+
+For audit attribution, configure this additional header in the existing plugin's `Headers` list, after the example header-stripping middleware removes caller-supplied identity:
+
+```yaml
+Headers:
+  - Name: X-Aio-User
+    Value: '{{ .claims.sub }}'
+    IncludeWhen: Authorized
+```
+
+Use the plugin's authenticated-only header inclusion behaviour; protect direct access and do not bypass authentication for AIO. The dashboard records actor, instance, action, reason and response status in operation logs; without the header it records `unattributed`. These logs do not grant permissions or forward agent credentials to users. See the plugin's [header configuration](https://traefik-oidc-auth.sevensolutions.cc/docs/getting-started/middleware-configuration#header-block).
+
+The dashboard groups rollout instances by node, exposes configuration/watch errors, and shows instance-wide lifetime local/global selections. Throughput is computed only after two live counter samples. Hostname debugging returns server-derived matching/candidate results without opening a backend connection; the raw response remains expandable. Operator dialogs pin the instance and require a reason and bounded exclusion duration.
