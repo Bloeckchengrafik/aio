@@ -1,4 +1,4 @@
-# Use the same built image as the agent. Create dashboard-token in aio-management.
+# Use the same built image as the agent. Browser authentication belongs to Traefik.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -58,8 +58,9 @@ spec:
               value: aio-system
             - name: AIO_API_TOKEN
               valueFrom: {secretKeyRef: {name: aio-management, key: api-token}}
-            - name: AIO_DASHBOARD_TOKEN
-              valueFrom: {secretKeyRef: {name: aio-management, key: dashboard-token}}
+            # Must match the origin used by the authenticated Traefik ingress.
+            - name: AIO_PUBLIC_ORIGIN
+              value: https://aio.asorda.net
           ports:
             - name: http
               containerPort: 8080
