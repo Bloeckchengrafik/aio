@@ -1,0 +1,56 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: minecraftroutes.akasha.asorda.net
+spec:
+  group: akasha.asorda.net
+  names:
+    categories: []
+    kind: MinecraftRoute
+    plural: minecraftroutes
+    shortNames: []
+    singular: minecraftroute
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for RouteSpec via `CustomResource`
+        properties:
+          spec:
+            additionalProperties: false
+            properties:
+              backend:
+                additionalProperties: false
+                properties:
+                  port:
+                    format: uint16
+                    maximum: 65535.0
+                    minimum: 0.0
+                    type: integer
+                  service:
+                    type: string
+                required:
+                - port
+                - service
+                type: object
+              hostnames:
+                items:
+                  type: string
+                type: array
+              proxyProtocol:
+                type: boolean
+            required:
+            - backend
+            - hostnames
+            - proxyProtocol
+            type: object
+        required:
+        - spec
+        title: MinecraftRoute
+        type: object
+    served: true
+    storage: true
+    subresources: {}
+

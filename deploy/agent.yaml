@@ -1,0 +1,130 @@
+# Replace image and create aio-management Secret with an api-token key.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aio-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aio-agent
+  namespace: aio-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aio-discovery
+rules:
+  - apiGroups: [akasha.asorda.net]
+    resources: [minecraftroutes]
+    verbs: [get, list, watch]
+  - apiGroups: ['']
+    resources: [services]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aio-discovery
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aio-discovery
+subjects:
+  - kind: ServiceAccount
+    name: aio-agent
+    namespace: aio-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aio-registration
+  namespace: aio-system
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, patch, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aio-registration
+  namespace: aio-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aio-registration
+subjects:
+  - kind: ServiceAccount
+    name: aio-agent
+    namespace: aio-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aio-agent
+  namespace: aio-system
+spec:
+  selector:
+    matchLabels: {app: aio-agent}
+  minReadySeconds: 5
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  template:
+    metadata:
+      labels: {app: aio-agent}
+    spec:
+      serviceAccountName: aio-agent
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        akasha.asorda.net/public-ingress: 'true'
+      terminationGracePeriodSeconds: 1830
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: aio
+          image: ghcr.io/bloeckchengrafik/aio:prototype
+          command: [/usr/local/bin/aio-agent]
+          # No hostPort/containerPort reservation: same-node surge must work.
+          env:
+            - name: AIO_NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: AIO_INSTANCE_ID
+              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+            - name: NODE_IP
+              valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+            - name: AIO_MANAGEMENT_LISTEN
+              value: '$(NODE_IP):0'
+            - name: AIO_MANAGEMENT_ADDRESS_FILE
+              value: /run/aio/address
+            - name: AIO_NAMESPACE
+              value: '*'
+            - name: AIO_REGISTRATION_NAMESPACE
+              value: aio-system
+            - name: AIO_API_TOKEN
+              valueFrom: {secretKeyRef: {name: aio-management, key: api-token}}
+          readinessProbe:
+            exec:
+              command: [/usr/local/bin/aio-probe, ready, /run/aio/address]
+          livenessProbe:
+            exec:
+              command: [/usr/local/bin/aio-probe, live, /run/aio/address]
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: run, mountPath: /run/aio}
+      volumes:
+        - name: run
+          emptyDir: {}

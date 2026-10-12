@@ -1,0 +1,15 @@
+routes:
+  - id: demo/main
+    hostnames: [asorda.net, play.asorda.net]
+    proxyProtocol: false
+    endpoints:
+      - id: demo-proxy/127.0.0.1:25566
+        address: 127.0.0.1:25566
+        nodeName: local
+  - id: demo/construct
+    hostnames: [construct.asorda.net]
+    proxyProtocol: true
+    endpoints:
+      - id: construct-proxy/127.0.0.1:25567
+        address: 127.0.0.1:25567
+        nodeName: another-node

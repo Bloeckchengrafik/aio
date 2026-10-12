@@ -1,0 +1,26 @@
+apiVersion: akasha.asorda.net/v1alpha1
+kind: MinecraftRoute
+metadata:
+  name: asorda
+  namespace: asorda
+spec:
+  hostnames: [asorda.net, play.asorda.net]
+  backend:
+    service: proxy
+    port: 25565
+  proxyProtocol: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy
+  namespace: asorda
+spec:
+  clusterIP: None
+  selector:
+    prism.asorda.net/app: proxy
+  ports:
+    - name: minecraft
+      port: 25565
+      targetPort: 25565
+      protocol: TCP
