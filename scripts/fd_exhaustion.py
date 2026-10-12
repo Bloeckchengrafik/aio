@@ -50,7 +50,7 @@ def main():
         log = Path(directory) / "agent.log"
         with log.open("w") as output:
             try:
-                process = subprocess.Popen([str(ROOT / "target/debug/aio-agent"), "--config", str(config), "--listen", f"127.0.0.1:{ingress}", "--management-listen", f"127.0.0.1:{management}", "--max-connections", "1", "--drain-timeout-seconds", "1"], env=os.environ | {"AIO_API_TOKEN": "fd-test", "TOKIO_WORKER_THREADS": "2", "RUST_LOG": "aio=info,axum=warn"}, stdout=output, stderr=output, preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (160, 160)))
+                process = subprocess.Popen([str(ROOT / "target/debug/aio-agent"), "--config", str(config), "--listen", f"127.0.0.1:{ingress}", "--management-listen", f"127.0.0.1:{management}", "--max-connections", "1", "--drain-timeout-seconds", "1"], env={key: value for key, value in os.environ.items() if key != "AIO_DISCORD_WEBHOOK_URL"} | {"AIO_API_TOKEN": "fd-test", "TOKIO_WORKER_THREADS": "2", "RUST_LOG": "aio=info,axum=warn"}, stdout=output, stderr=output, preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (160, 160)))
                 deadline = time.monotonic() + 10
                 while True:
                     try:

@@ -286,26 +286,14 @@ async fn forward_login(
         .await
         {
             Ok(Ok(stream)) => {
-                state
-                    .circuits
-                    .lock()
-                    .unwrap()
-                    .entry(endpoint.id.clone())
-                    .or_default()
-                    .success();
+                state.circuit_result(&route.id, endpoint, true);
                 guard.completed = true;
                 selected(&state, endpoint);
                 upstream = Some(stream);
                 break;
             }
             _ => {
-                state
-                    .circuits
-                    .lock()
-                    .unwrap()
-                    .entry(endpoint.id.clone())
-                    .or_default()
-                    .failure();
+                state.circuit_result(&route.id, endpoint, false);
                 guard.completed = true;
                 state.event(format!("upstream connect failed: {}", endpoint.id));
             }
@@ -427,18 +415,16 @@ async fn status_exchange(
                 anyhow::Ok(packet)
             })
             .await;
-            let mut circuits = state.circuits.lock().unwrap();
-            let circuit = circuits.entry(endpoint.id.clone()).or_default();
             guard.completed = true;
             match result {
                 Ok(Ok(packet)) => {
-                    circuit.success();
+                    state.circuit_result(&route.id, endpoint, true);
                     selected(state, endpoint);
                     response = Some(packet);
                     break;
                 }
                 _ => {
-                    circuit.failure();
+                    state.circuit_result(&route.id, endpoint, false);
                     state.event(format!("upstream status failed: {}", endpoint.id));
                 }
             }

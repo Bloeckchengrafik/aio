@@ -150,15 +150,35 @@ async fn route_control(
         ));
     }
     let c = controls.entry(body.route_id.clone()).or_default();
+    let was_allowed = route.allow_connections && !c.blocked;
     c.blocked = body.action != "allow";
+    let changed = was_allowed != (route.allow_connections && !c.blocked)
+        || (body.action == "kill" && c.sessions.values().any(|t| !t.is_cancelled()));
+    let sessions = c.sessions.len();
     let disconnected = if body.action == "kill" {
+        let count = c.sessions.values().filter(|t| !t.is_cancelled()).count();
         for token in c.sessions.values() {
             token.cancel();
         }
-        c.sessions.len()
+        count
     } else {
         0
     };
+    use crate::notifications::{Kind, Notification};
+    let kind = match body.action.as_str() {
+        "stop" => Kind::RouteStopped,
+        "kill" => Kind::RouteKilled,
+        _ => Kind::RouteAllowed,
+    };
+    let mut notification = Notification::new(kind, &body.route_id, &s.node, &s.instance);
+    notification.affected_sessions = if body.action == "kill" {
+        disconnected
+    } else {
+        sessions
+    };
+    if changed {
+        s.notifications.send(notification);
+    }
     drop(snapshot);
     drop(controls);
     s.event(format!(
@@ -276,7 +296,7 @@ async fn reset(
     Ok(Json(serde_json::json!({"ok":true})))
 }
 async fn metrics(State(s): State<Arc<AgentState>>) -> String {
-    [
+    let mut output: String = [
         ("aio_connections_active", s.active.load(Ordering::Relaxed)),
         ("aio_connections_total", s.total.load(Ordering::Relaxed)),
         (
@@ -299,5 +319,8 @@ async fn metrics(State(s): State<Arc<AgentState>>) -> String {
     ]
     .into_iter()
     .map(|(name, value)| format!("{name} {value}\n"))
-    .collect()
+    .collect();
+    output.push_str(&s.circuit_metrics());
+    output.push_str(&s.notifications.metrics());
+    output
 }

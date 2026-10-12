@@ -1,6 +1,7 @@
 pub mod api;
 pub mod discovery;
 pub mod model;
+pub mod notifications;
 pub mod protocol;
 pub mod registration;
 pub mod resources;

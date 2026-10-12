@@ -33,6 +33,8 @@ struct Args {
     config: Option<PathBuf>,
     #[arg(long, env = "AIO_API_TOKEN", hide_env_values = true)]
     api_token: String,
+    #[arg(long, env = "AIO_DISCORD_WEBHOOK_URL", hide_env_values = true)]
+    discord_webhook_url: Option<String>,
     #[arg(long, default_value_t = 5)]
     handshake_timeout_seconds: u64,
     #[arg(long, default_value_t = 2)]
@@ -77,6 +79,12 @@ async fn main() -> anyhow::Result<()> {
         args.instance_id
             .unwrap_or_else(|| format!("local-{}", std::process::id())),
     );
+    let notification_cancel = CancellationToken::new();
+    let notification_task = args
+        .discord_webhook_url
+        .as_deref()
+        .map(|url| state.notifications.start(url, notification_cancel.clone()))
+        .transpose()?;
     #[cfg(unix)]
     state.fd_limit.store(
         aio::resources::ensure_descriptors(args.max_connections)?,
@@ -190,6 +198,10 @@ async fn main() -> anyhow::Result<()> {
     cancel.cancel();
     api_cancel.cancel();
     registration_cancel.cancel();
+    notification_cancel.cancel();
+    if let Some(task) = notification_task {
+        task.await?;
+    }
     api_task.await?;
     discovery_task.await?;
     if let Some(task) = registration_task {

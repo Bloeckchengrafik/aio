@@ -110,6 +110,10 @@ spec:
               value: aio-system
             - name: AIO_API_TOKEN
               valueFrom: {secretKeyRef: {name: aio-management, key: api-token}}
+            # Optional: populate discord-webhook-url in the same Secret.
+            - name: AIO_DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef: {name: aio-management, key: discord-webhook-url, optional: true}
           readinessProbe:
             exec:
               command: [/usr/local/bin/aio-probe, ready, /run/aio/address]
